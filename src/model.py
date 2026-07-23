@@ -117,10 +117,24 @@ class Encoder(nn.Module):
         return out  # [S, B, D]
 
 
-class TaskDecoder(nn.Module):
+class SharedTaskDecoder(nn.Module):
+    """One decoder *body* shared by all four sequence tasks.
+
+    It mirrors the old per-task LSTM decoder (teacher-forcing path with packed
+    sequences + cross-attention to the encoder), but it does NOT own an embedding
+    table or an output projection -- those are task-specific (the input tokens of
+    ``separated_graphmes`` live in the *grapheme* vocab, the other three in the
+    *phoneme* vocab).  Instead the body receives an already-embedded sequence and
+    returns the combined hidden, which the per-task :class:`TaskHead` projects to
+    its own vocabulary.  This removes the 4x LSTM + 4x attention redundancy of the
+    old design (refine.md) while keeping all four outputs.
+
+    (One shared embedding table is shared by the three phoneme tasks; the grapheme
+    task uses its own table -- see :class:`G2PModel`.)
+    """
+
     def __init__(
         self,
-        vocab_size: int,
         embed_dim: int,
         dec_hidden: int,
         num_layers: int,
@@ -128,13 +142,7 @@ class TaskDecoder(nn.Module):
         enc_dim: int,
     ):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
         self.pos = PositionalEncoding(embed_dim)
-        # PyTorch's LSTM only applies dropout *between* layers, so a single-layer
-        # LSTM silently ignores `dropout` (and warns). For 1-layer decoders we
-        # therefore zero the LSTM's internal dropout and apply an explicit
-        # nn.Dropout on the output in the training (teacher-forcing) path, so the
-        # configured `dropout` actually regularises the decoder.
         self.lstm = nn.LSTM(
             embed_dim, dec_hidden, num_layers,
             dropout=dropout if num_layers > 1 else 0, batch_first=False
@@ -142,16 +150,34 @@ class TaskDecoder(nn.Module):
         self.rec_drop = nn.Dropout(dropout) if num_layers == 1 else None
         self.attn_query = nn.Linear(dec_hidden, enc_dim)
         self.attn_combine = nn.Linear(dec_hidden + enc_dim, dec_hidden)
-        self.out = nn.Linear(dec_hidden, vocab_size)
-        # weight tying: share the output projection with the input embedding
-        # (both are [vocab_size, dec_hidden]). Cuts the decoder parameter count
-        # roughly in half with no change to the exportable ONNX graph.
-        if dec_hidden == embed_dim:
-            self.out.weight = self.embed.weight
-        self.task_bias = nn.Parameter(torch.zeros(vocab_size))
+
+    def _run(self, emb: torch.Tensor, tgt_len: torch.Tensor,
+             enc_out: torch.Tensor, src_mask: Optional[torch.Tensor],
+             hidden=None) -> torch.Tensor:
+        emb = self.pos(emb)
+        if tgt_len is not None:
+            # teacher-forcing path: pack the padded target sequence
+            packed = pack_padded_sequence(
+                emb, tgt_len.cpu(), enforce_sorted=False, batch_first=False
+            )
+            out, _ = self.lstm(packed)
+            out, _ = pad_packed_sequence(out, batch_first=False)  # [T, B, H]
+        else:
+            out, hidden = self.lstm(emb, hidden)  # [1, B, H]
+        if self.rec_drop is not None:
+            out = self.rec_drop(out)
+        combined = self._attend(out, enc_out, src_mask)
+        return combined  # [T, B, H] or [1, B, H] hidden
+
+    def forward_teacher(self, emb, tgt_len, enc_out, src_mask):
+        return self._run(emb, tgt_len, enc_out, src_mask)
+
+    def generate_step(self, emb, step, hidden, enc_out, src_mask):
+        emb = emb + self.pos.at(step)
+        combined = self._run(emb, None, enc_out, src_mask, hidden=hidden)
+        return combined, hidden  # combined: [1, B, H]
 
     def _attend(self, dec_h: torch.Tensor, enc_out: torch.Tensor, src_mask: Optional[torch.Tensor]):
-        # dec_h: [T, B, H]; enc_out: [S, B, enc_dim]
         q = self.attn_query(dec_h)  # [T, B, enc_dim]
         q_t = q.transpose(0, 1)            # [B, T, enc_dim]
         enc_t = enc_out.transpose(0, 1)    # [B, S, enc_dim]
@@ -164,42 +190,23 @@ class TaskDecoder(nn.Module):
         combined = torch.tanh(self.attn_combine(torch.cat([dec_h, context], dim=-1)))
         return combined
 
-    def forward_teacher(
-        self,
-        tgt: torch.Tensor,
-        tgt_len: torch.Tensor,
-        enc_out: torch.Tensor,
-        src_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        # training targets arrive batch-first [B, T]; decoders are seq-first
-        tgt = tgt.transpose(0, 1).contiguous()  # [T, B]
-        emb = self.embed(tgt) * math.sqrt(self.embed.embedding_dim)
-        emb = self.pos(emb)
-        packed = pack_padded_sequence(
-            emb, tgt_len.cpu(), enforce_sorted=False, batch_first=False
-        )
-        out, _ = self.lstm(packed)
-        out, _ = pad_packed_sequence(out, batch_first=False)  # [T, B, H]
-        if self.rec_drop is not None:
-            out = self.rec_drop(out)
-        combined = self._attend(out, enc_out, src_mask)
-        logits = self.out(combined) + self.task_bias  # [T, B, V]
-        return logits
 
-    def generate_step(
-        self,
-        inp: torch.Tensor,
-        step: int,
-        hidden,
-        enc_out: torch.Tensor,
-        src_mask: Optional[torch.Tensor],
-    ):
-        emb = self.embed(inp) * math.sqrt(self.embed.embedding_dim)  # [1, B, E]
-        emb = emb + self.pos.at(step)
-        out, hidden = self.lstm(emb, hidden)  # out: [1, B, H]
-        combined = self._attend(out, enc_out, src_mask)  # [1, B, H]
-        logits = self.out(combined) + self.task_bias  # [1, B, V]
-        return logits, hidden
+class TaskHead(nn.Module):
+    """Linear head: shared decoder hidden -> task logits.
+
+    Weight-tying with the task's input embedding (both ``[vocab, dec_hidden]``)
+    keeps the head parameter count tiny when shapes line up, and links input and
+    output projections of the same vocabulary.
+    """
+
+    def __init__(self, dec_hidden: int, vocab_size: int, embed_weight: nn.Parameter):
+        super().__init__()
+        self.out = nn.Linear(dec_hidden, vocab_size, bias=True)
+        if dec_hidden == embed_weight.size(1):
+            self.out.weight = embed_weight  # tie with the task's input embedding
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.out(hidden)  # [T, B, V]
 
 
 class G2PModel(nn.Module):
@@ -225,10 +232,24 @@ class G2PModel(nn.Module):
             dropout, num_langs, lang_embed_dim,
         )
         enc_dim = embed_dim
-        self.dec_phonemes = TaskDecoder(phoneme_vocab_size, embed_dim, dec_hidden, dec_layers, dropout, enc_dim)
-        self.dec_separated_graphmes = TaskDecoder(grapheme_tgt_vocab_size, embed_dim, dec_hidden, dec_layers, dropout, enc_dim)
-        self.dec_separated_phonemes = TaskDecoder(phoneme_vocab_size, embed_dim, dec_hidden, dec_layers, dropout, enc_dim)
-        self.dec_aligned_phonemes = TaskDecoder(phoneme_vocab_size, embed_dim, dec_hidden, dec_layers, dropout, enc_dim)
+        # Input embedding tables. The three phoneme tasks share one table; the
+        # grapheme task uses its own (they live in different vocabularies).
+        self.phoneme_embed = nn.Embedding(phoneme_vocab_size, embed_dim, padding_idx=0)
+        self.grapheme_embed = nn.Embedding(grapheme_tgt_vocab_size, embed_dim, padding_idx=0)
+        # ONE shared decoder body for all four sequence tasks.
+        self.shared_decoder = SharedTaskDecoder(
+            embed_dim, dec_hidden, dec_layers, dropout, enc_dim
+        )
+        # Four cheap task heads (weight-tied to their own input embedding table).
+        self.heads = nn.ModuleDict({
+            "phonemes": TaskHead(dec_hidden, phoneme_vocab_size, self.phoneme_embed.weight),
+            "separated_phonemes": TaskHead(dec_hidden, phoneme_vocab_size, self.phoneme_embed.weight),
+            "aligned_phonemes": TaskHead(dec_hidden, phoneme_vocab_size, self.phoneme_embed.weight),
+            "separated_graphmes": TaskHead(dec_hidden, grapheme_tgt_vocab_size, self.grapheme_embed.weight),
+        })
+        # Graph boundary: PAD/SEP classification straight from the encoder hidden
+        # (no autoregressive decoding needed -- it is a per-source-timestep tag).
+        self.graph_boundary = nn.Linear(enc_dim, 2)
 
     # ---- training ----
     def forward(
@@ -242,20 +263,30 @@ class G2PModel(nn.Module):
         src = src.transpose(0, 1).contiguous()   # [S, B]
         src_mask = _make_src_mask(src, src_len)  # [B, S] bool (src is seq-first)
         enc_out = self.encoder(src, src_len, lang)  # [S, B, D]
+
+        # Graph boundary over the source sequence.
+        glogits = self.graph_boundary(enc_out)   # [S, B, 2]
+
+        # One shared decoder body, four linear heads. Each task embeds its own
+        # target with its own vocabulary table, then all share the SAME decoder
+        # LSTM/attention weights (refine.md: 4x decoder params -> 1x).
         logits: Dict[str, torch.Tensor] = {}
-        logits["phonemes"] = self.dec_phonemes.forward_teacher(
-            targets["phonemes"], target_lens["phonemes"], enc_out, src_mask
-        )
-        logits["separated_graphmes"] = self.dec_separated_graphmes.forward_teacher(
-            targets["separated_graphmes"], target_lens["separated_graphmes"], enc_out, src_mask
-        )
-        logits["separated_phonemes"] = self.dec_separated_phonemes.forward_teacher(
-            targets["separated_phonemes"], target_lens["separated_phonemes"], enc_out, src_mask
-        )
-        logits["aligned_phonemes"] = self.dec_aligned_phonemes.forward_teacher(
-            targets["aligned_phonemes"], target_lens["aligned_phonemes"], enc_out, src_mask
-        )
+        for name, head in self.heads.items():
+            tgt = targets[name]                      # [B, T] batch-first
+            emb = self._embed_task(name, tgt)
+            hidden = self.shared_decoder.forward_teacher(
+                emb, target_lens[name], enc_out, src_mask
+            )  # [T, B, H]
+            logits[name] = head(hidden)
+        logits["graph_boundary"] = glogits
+        logits["graph_boundary_len"] = src_len
         return logits
+
+    def _embed_task(self, name: str, tgt: torch.Tensor) -> torch.Tensor:
+        """Embed a batch-first target with the correct vocabulary table."""
+        table = self.grapheme_embed if name == "separated_graphmes" else self.phoneme_embed
+        tgt = tgt.transpose(0, 1).contiguous()  # [T, B]
+        return table(tgt) * math.sqrt(table.embedding_dim)  # [T, B, E]
 
     # ---- inference / ONNX (free-run greedy, fixed steps) ----
     def generate(
@@ -273,28 +304,26 @@ class G2PModel(nn.Module):
         src_mask = _make_src_mask(src, src_len)
         enc_out = self.encoder(src, src_len, lang)
 
-        decoders = {
-            "phonemes": self.dec_phonemes,
-            "separated_graphmes": self.dec_separated_graphmes,
-            "separated_phonemes": self.dec_separated_phonemes,
-            "aligned_phonemes": self.dec_aligned_phonemes,
-        }
-        # store outputs per step, one tensor [1, B, V] each
-        outputs: Dict[str, List[torch.Tensor]] = {k: [] for k in decoders}
-        hidden = {k: None for k in decoders}
-        inp = {k: torch.full((1, B), sos_idx, dtype=torch.long, device=device) for k in decoders}
+        # Greedy decode each task independently (different vocabularies), but all
+        # through the SAME shared decoder body.
+        outputs: Dict[str, List[torch.Tensor]] = {k: [] for k in self.heads}
+        hiddens = {k: None for k in self.heads}
+        prev = {k: torch.full((1, B), sos_idx, dtype=torch.long, device=device) for k in self.heads}
 
         for t in range(max_len):
-            all_eos = early_stop and eos_idx is not None
-            for name, dec in decoders.items():
-                logits, h = dec.generate_step(inp[name], t, hidden[name], enc_out, src_mask)
-                hidden[name] = h
+            step_eos = early_stop and eos_idx is not None
+            for name in self.heads:
+                table = self.grapheme_embed if name == "separated_graphmes" else self.phoneme_embed
+                emb = table(prev[name]) * math.sqrt(table.embedding_dim)  # [1, B, E]
+                combined, hiddens[name] = self.shared_decoder.generate_step(
+                    emb, t, hiddens[name], enc_out, src_mask
+                )  # [1, B, H]
+                logits = self.heads[name](combined)       # [1, B, V]
                 outputs[name].append(logits)
-                nxt = logits.argmax(dim=-1)  # [1, B]
-                inp[name] = nxt
-                if all_eos:
-                    all_eos = all_eos and bool((nxt == eos_idx).all())
-            if all_eos:
+                prev[name] = logits.argmax(dim=-1)        # [1, B]
+                if step_eos:
+                    step_eos = step_eos and bool((prev[name] == eos_idx).all())
+            if step_eos:
                 break
         return {k: torch.cat(v, dim=0) for k, v in outputs.items()}  # [T, B, V]
 

@@ -182,6 +182,12 @@ def main():
         phoneme_vocab.stoi("|"),
         phoneme_vocab.stoi("/"),
         grapheme_tgt_vocab.stoi("|"),
+        # Space is ALSO a separator (finer-grained than | /). Both phoneme and
+        # grapheme-tgt target vocabularies put the space token at id 1 (right after
+        # PAD=0), so 1 is its id in every separator target. Excluded from content
+        # frames in the consistency loss so the model learns separator *positions*,
+        # not space-as-content (refine.md / user note: "空格也是一种分隔符").
+        phoneme_vocab.stoi(" "),
     )
 
     model = G2PModel(
@@ -369,20 +375,21 @@ def _task_and_consistency_loss(model, src, src_len, lang, targets, tgt_lens,
 
     cons_loss = torch.zeros((), device=src.device)
     if cfg.consistency_weight or cfg.grapheme_consistency_weight:
-        pipe_id, slash_id, graph_id = sep_ids
+        pipe_id, slash_id, graph_id, space_id = sep_ids
         eos_ph = phoneme_vocab.eos_idx
         eos_gr = grapheme_tgt_vocab.eos_idx
         c_ph = (
             phoneme_consistency(logits["phonemes"], logits["separated_phonemes"],
                                 targets["separated_phonemes"], pipe_id,
-                                pad_idx_dict["phonemes"], eos_ph)
+                                pad_idx_dict["phonemes"], eos_ph, space_id=space_id)
             + phoneme_consistency(logits["phonemes"], logits["aligned_phonemes"],
                                   targets["aligned_phonemes"], slash_id,
-                                  pad_idx_dict["phonemes"], eos_ph)
+                                  pad_idx_dict["phonemes"], eos_ph, space_id=space_id)
         ) * 0.5
         c_gr = grapheme_consistency(
             logits["separated_graphmes"], targets["separated_graphmes"], graph_id,
             pad_idx_dict["separated_graphmes"], len(grapheme_tgt_vocab), eos_gr,
+            space_id=space_id,
         )
         cons_loss = cfg.consistency_weight * c_ph + cfg.grapheme_consistency_weight * c_gr
     return task_loss, cons_loss

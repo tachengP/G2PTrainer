@@ -42,7 +42,7 @@ import torch.nn.functional as F
 _PRED_FRAMES = slice(0, -1)
 
 
-def phoneme_consistency(logits_base, logits_sep, tgt_sep, sep_id, pad_id, eos_id):
+def phoneme_consistency(logits_base, logits_sep, tgt_sep, sep_id, pad_id, eos_id, space_id=1):
     """KL( p_base || p_sep ) over the content frames of the separator decoder.
 
     Args:
@@ -54,12 +54,17 @@ def phoneme_consistency(logits_base, logits_sep, tgt_sep, sep_id, pad_id, eos_id
         pad_id:      vocab id of the padding token in ``V``.
         eos_id:      vocab id of the stop token; excluded from content frames so the
                      trailing ``<eos>`` is not treated as a phoneme to align.
+        space_id:    vocab id of the space token (`` ``). Space is ALSO a separator
+                     (a finer-grained one than ``|``/``/``); it must be excluded from
+                     content frames so the model learns to predict separator *positions*
+                     rather than treating a space as phoneme content. See refine.md /
+                     the user note: "空格也是一种分隔符".
     """
     B = tgt_sep.size(0)
     losses = []
     for b in range(B):
         pred = tgt_sep[b, 1:]                       # [T_sep-1] symbols predicted by frames 0..T_sep-2
-        content = (pred != sep_id) & (pred != pad_id) & (pred != eos_id)
+        content = (pred != sep_id) & (pred != space_id) & (pred != pad_id) & (pred != eos_id)
         idx = content.nonzero(as_tuple=False).squeeze(-1)   # [K] logits-frame indices of content
         K = idx.numel()
         if K == 0:
@@ -76,7 +81,7 @@ def phoneme_consistency(logits_base, logits_sep, tgt_sep, sep_id, pad_id, eos_id
     return torch.stack(losses).mean()
 
 
-def grapheme_consistency(logits_sep, tgt_sep, sep_id, pad_id, num_classes, eos_id):
+def grapheme_consistency(logits_sep, tgt_sep, sep_id, pad_id, num_classes, eos_id, space_id=1):
     """KL( one_hot(content) || p_sep ) over the content frames of ``separated_graphmes``.
 
     Args:
@@ -86,12 +91,15 @@ def grapheme_consistency(logits_sep, tgt_sep, sep_id, pad_id, num_classes, eos_i
         pad_id:      vocab id of the padding token.
         num_classes: size of the grapheme-target vocab (``V_gr``).
         eos_id:      vocab id of the stop token; excluded from content frames.
+        space_id:    vocab id of the space token (`` ``). Space is ALSO a separator
+                     (finer-grained than ``|``); excluded from content frames so the
+                     model learns separator *positions*, not space-as-grapheme-content.
     """
     B = tgt_sep.size(0)
     losses = []
     for b in range(B):
         pred = tgt_sep[b, 1:]
-        content = (pred != sep_id) & (pred != pad_id) & (pred != eos_id)
+        content = (pred != sep_id) & (pred != space_id) & (pred != pad_id) & (pred != eos_id)
         idx = content.nonzero(as_tuple=False).squeeze(-1)   # [K]
         K = idx.numel()
         if K == 0:
