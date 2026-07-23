@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Training / export artifacts
+checkpoints/
+*.pt
+*.onnx
+
+# Logs / scratch
+*.log
+debug.py
+test_ckpt/

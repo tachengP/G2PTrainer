@@ -1,0 +1,74 @@
+# G2P multi-task training configuration
+
+# --- data ---
+data_dir: data/Korean
+output_dir: checkpoints
+model_name: Korean             # run artifacts saved under checkpoints/{model_name}
+file_glob: "dataset-ko.csv"     # language is parsed as the token after the last '-'
+phoneme_set: null              # optional path to a file with one phoneme per line
+max_src_len: 120
+max_tgt_len: 120
+val_split: 0.05
+seed: 42
+# binarize: preprocess CSVs into compact mmap-able numpy binaries under
+# {data_dir}/binary so training streams rows from disk (no host-RAM spike).
+# auto-binarize runs (with binarize_workers threads) before training, only
+# when the binaries are missing or stale; training itself uses num_workers=0.
+binarize: true
+binarize_workers: 8
+binary_dir: null   # null -> {data_dir}/binary
+
+# --- vocabulary / subword ---
+bpe_merges: 3000               # BPE merge operations for the grapheme vocab
+min_freq: 1
+max_samples: null              # cap rows read per dataset (null = use the whole file)
+
+# --- model ---
+# Kept compact on purpose: each decoder output projection shares weights with
+# its input embedding (weight tying, see src/model.py), so the effective
+# parameter count is already ~half of a naive setup. These dims are the main
+# knob for inference speed -- smaller hidden / fewer layers => faster decode.
+embed_dim: 128
+enc_layers: 2
+dec_layers: 1
+enc_heads: 4
+dec_hidden: 128
+ffn_dim: 256
+dropout: 0.1
+lang_embed_dim: 8              # language embedding dimension; 0 disables lang embed
+max_langs: 64
+
+# --- training ---
+epochs: 30
+batch_size: 2048
+lr: 1.0e-3
+weight_decay: 1.0e-5
+grad_clip: 5.0
+lr_decay_gamma: 0.8          # decay lr to 80% of previous epoch (1.0 = no decay)
+fp16: true
+# Group similar-length samples in each batch. Essential so that larger batch
+# sizes do NOT get slower (padding stays ~constant instead of exploding with
+# batch size). Keep true unless you have a reason to randomise batch membership.
+sort_by_length: true                    # mixed precision (AMP) on CUDA
+device: auto                   # auto | cuda | cpu
+num_workers: 12
+log_every: 100
+save_every: 1000
+
+# --- consistency losses (associate grapheme / phoneme content across tasks) ---
+consistency_weight: 0.5            # phoneme consistency (cross-decoder) weight
+grapheme_consistency_weight: 0.5   # grapheme consistency (source reconstruction) weight
+
+# --- tensorboard monitoring ---
+tensorboard: true                  # enable TensorBoard logging
+tb_log_dir: null                   # null -> checkpoints/{model_name}/tb-logs
+num_fixed_samples: 5               # fixed val samples tracked every epoch / at each save
+fixed_samples_seed: 1337           # deterministic selection of the fixed samples
+# log_every also drives the step-granularity (transient) loss curves in TensorBoard
+
+# --- deployment artifact (small: weights only, optional fp16) ---
+save_model_only: true             # also write model_best/model_last.pt (no optimizer)
+export_dtype: fp16                # dtype of those files: fp32 | fp16 (fp16 ~ halves size)
+
+# --- data residency ---
+data_on_gpu: false                # false -> stream from disk with num_workers prefetch (GPU fed continuously, low VRAM); true -> resident on CUDA (num_workers=0)
