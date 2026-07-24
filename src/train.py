@@ -1,199 +1,49 @@
-"""Training loop: CUDA-aware, optional mixed precision, checkpointing."""
+"""Training entrypoint (PyTorch, CPU- or GPU-friendly)."""
 
 from __future__ import annotations
 
+import json
 import os
+import random
 import sys
 import time
-import random
-from typing import Dict, List
-
-import torch
-import torch.nn as nn
-from torch.amp import autocast, GradScaler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import build_config, resolve_device
-from src import data as data_mod
-from src import preprocessing as pp
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm is optional; degrade gracefully to a plain iterator
+    tqdm = None
+
+from src.config import build_config
 from src.model import G2PModel
-from src.data import TARGET_NAMES, make_loader
-from src.utils import greedy_decode
-from tqdm import tqdm
-from src.consistency import phoneme_consistency, grapheme_consistency
+from src.bin_data import run_binarize, load_binary
+from src.data import make_loader
+from src.preprocessing import (
+    PIPE,
+    SLASH,
+    TARGET_NAMES,
+    reconstruct_groups,
+    resegment_by_vowels,
+    record_targets,
+    parse_no_sep,
+)
+
+SEP_UNIT = {
+    "separated_graphmes": ("|", ""),
+    "separated_phonemes": ("|", " "),
+    "aligned_phonemes": ("/", " "),
+}
 
 
-_SPECIAL_TOKENS = {"<pad>", "<sos>", "<eos>", "<unk>"}
-
-
-def _decode_pred(indices, vocab, sep="") -> str:
-    """Decode model output ids to a string, dropping padding/SOS/EOS/UNK.
-
-    ``sep`` joins the decoded units -- the bare ``phonemes`` task has no in-string
-    separator token (its vocab is whitespace-split), so we re-insert a space to
-    match the CSV; ``separated_*`` / ``aligned_*`` already carry ``|`` / ``/``.
-    """
-    syms = vocab.decode(indices)  # List[str]
-    return sep.join(s for s in syms if s not in _SPECIAL_TOKENS)
-
-
-@torch.no_grad()
-def _infer_fixed_samples(model, fixed_samples, tokenizer, src_vocab, phoneme_vocab,
-                         grapheme_tgt_vocab, lang2id, device, max_tgt, sos_idx=1):
-    """Run the model on the fixed val samples; return a list of result dicts.
-
-    Each result is ``{"input", "lang", "pred": {target_name: decoded_str}}``.
-    """
-    results: List[Dict] = []
-    for fs in fixed_samples:
-        units = tokenizer.tokenize(fs["text"])
-        ids = src_vocab.encode(units) if units else []
-        if not ids:
-            continue
-        src = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(1)  # [S,1]
-        src_len = torch.tensor([len(ids)], dtype=torch.long, device=device)
-        lang = torch.tensor([lang2id[fs["lang"]]], dtype=torch.long, device=device)
-        logits = model.generate(
-            src, src_len, lang, max_tgt, sos_idx,
-            eos_idx=phoneme_vocab.eos_idx, early_stop=True,
-        )  # {k:[T,1,V]}
-        pred: Dict[str, str] = {}
-        for k, lg in logits.items():
-            lg = lg.permute(1, 0, 2)  # [1,T,V] -> greedy_decode expects batch-first
-            vocab = grapheme_tgt_vocab if k == "separated_graphmes" else phoneme_vocab
-            toks = greedy_decode(lg, vocab.eos_idx, vocab.pad_idx)[0]
-            pred[k] = _decode_pred(toks, vocab, sep=" " if k == "phonemes" else "")
-        results.append({"input": fs["text"], "lang": fs["lang"], "pred": pred})
-    return results
-
-
-def _render_fixed_text(results: List[Dict]) -> str:
-    lines: List[str] = []
-    for i, r in enumerate(results):
-        lines.append(f"[{i}] lang={r['lang']}  in : {r['input']}")
-        for k in TARGET_NAMES:
-            lines.append(f"     {k}: {r['pred'][k]}")
-    return "\n".join(lines)
-
-
-def _write_fixed_predictions(path: str, results: List[Dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(_render_fixed_text(results) + "\n")
-
-
-def main():
-    cfg = build_config()
-    device = resolve_device(cfg.device)
-    print(f"[info] device = {device}")
-
-    # All artifacts for this run live under checkpoints/{model_name}
-    run_dir = os.path.join(cfg.output_dir, cfg.model_name)
-    os.makedirs(run_dir, exist_ok=True)
-
-    # ----------------------------------------------------------------- build dataset
-    if cfg.binarize:
-        from src.binarize import ensure_binary, load_binary
-        binary_dir = ensure_binary(cfg)
-        (train_ds, val_ds, src_vocab, phoneme_vocab, grapheme_tgt_vocab,
-         tokenizer, pad_idx_dict, meta, val_monitor) = load_binary(binary_dir, device)
-        use_binary = True
-        print(f"[info] loaded binarized dataset from {binary_dir}")
-    else:
-        (train_ds, val_ds, src_vocab, phoneme_vocab, grapheme_tgt_vocab,
-         tokenizer, pad_idx_dict, meta, val_monitor) = data_mod.build_dataset(
-            data_dir=cfg.data_dir,
-            file_glob=cfg.file_glob,
-            bpe_merges=cfg.bpe_merges,
-            min_freq=cfg.min_freq,
-            max_src_len=cfg.max_src_len,
-            max_tgt_len=cfg.max_tgt_len,
-            phoneme_set=cfg.phoneme_set,
-            val_split=cfg.val_split,
-            seed=cfg.seed,
-            max_samples=cfg.max_samples,
-        )
-        use_binary = False
-    print(f"[info] langs={meta['langs']} src_vocab={meta['src_vocab_size']} "
-          f"phoneme_vocab={meta['phoneme_vocab_size']} "
-          f"grapheme_tgt_vocab={meta['grapheme_tgt_vocab_size']} "
-          f"train={len(train_ds)} val={len(val_ds)}")
-
-    # Data residency:
-    #  * binarize=True + data_on_gpu=False (default): streaming mmap reader with
-    #    num_workers prefetch -> host RAM stays flat AND the GPU is kept fed.
-    #  * binarize=True + data_on_gpu=True: whole dataset resident on CUDA
-    #    (num_workers=0).
-    #  * binarize=False + data_on_gpu=True: whole dataset resident on CUDA
-    #    (num_workers=0).
-    #  * binarize=False + default: dataset on CPU in shared memory so the
-    #    (num_workers) subprocesses map ONE physical copy (full preprocessing par.).
-    if use_binary:
-        if cfg.data_on_gpu and device.startswith("cuda"):
-            # Whole dataset resident on CUDA: no parallel workers needed.
-            loader_num_workers = 0
-            loader_pin_memory = False
-            train_ds = train_ds.to_device(device)
-            val_ds = val_ds.to_device(device)
-            print(f"[info] binary dataset resident on {device} (num_workers=0)")
-        else:
-            # Prefetch batches in parallel worker processes so the GPU is never
-            # starved between steps. Each worker opens its own mmap (lazy) and the
-            # H2D copy is async via pinned memory + non_blocking.
-            loader_num_workers = cfg.num_workers
-            loader_pin_memory = device.startswith("cuda")
-            print(f"[info] binary dataset prefetched via {loader_num_workers} workers "
-                  f"(pin_memory={loader_pin_memory})")
-    elif cfg.data_on_gpu and device.startswith("cuda"):
-        train_ds = train_ds.to_device(device)
-        val_ds = val_ds.to_device(device)
-        loader_num_workers = 0
-        loader_pin_memory = False
-        print(f"[info] dataset resident on {device} (num_workers=0)")
-    else:
-        train_ds.share_memory()
-        val_ds.share_memory()
-        loader_num_workers = cfg.num_workers
-        loader_pin_memory = True
-
-    # ---- fixed val samples for monitoring (deterministic selection) ----
-    fixed_samples: List[Dict] = []
-    if cfg.num_fixed_samples > 0 and len(val_monitor) > 0:
-        frng = random.Random(cfg.fixed_samples_seed)
-        k = min(cfg.num_fixed_samples, len(val_monitor))
-        fidx = sorted(frng.sample(range(len(val_monitor)), k))
-        for i in fidx:
-            fixed_samples.append({"text": val_monitor[i]["text"],
-                                  "lang": val_monitor[i]["lang"]})
-    print(f"[info] fixed monitoring samples = {len(fixed_samples)} "
-          f"(seed={cfg.fixed_samples_seed})")
-
-    # ---- TensorBoard writer ----
-    writer = None
-    if cfg.tensorboard:
-        from torch.utils.tensorboard import SummaryWriter
-        # tensorboard logs go under checkpoints/{model_name}/tb-logs
-        tb_dir = cfg.tb_log_dir or os.path.join(run_dir, "tb-logs")
-        os.makedirs(tb_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=tb_dir)
-        print(f"[info] tensorboard -> {tb_dir}")
-
-    sep_ids = (
-        phoneme_vocab.stoi("|"),
-        phoneme_vocab.stoi("/"),
-        grapheme_tgt_vocab.stoi("|"),
-        # Space is ALSO a separator (finer-grained than | /). Both phoneme and
-        # grapheme-tgt target vocabularies put the space token at id 1 (right after
-        # PAD=0), so 1 is its id in every separator target. Excluded from content
-        # frames in the consistency loss so the model learns separator *positions*,
-        # not space-as-content (refine.md / user note: "空格也是一种分隔符").
-        phoneme_vocab.stoi(" "),
-    )
-
+def build_model(cfg, meta, count_vocab_size):
     model = G2PModel(
         src_vocab_size=meta["src_vocab_size"],
         phoneme_vocab_size=meta["phoneme_vocab_size"],
-        grapheme_tgt_vocab_size=meta["grapheme_tgt_vocab_size"],
+        count_vocab_size=count_vocab_size,
         num_langs=meta["num_langs"],
         embed_dim=cfg.embed_dim,
         enc_layers=cfg.enc_layers,
@@ -203,258 +53,298 @@ def main():
         ffn_dim=cfg.ffn_dim,
         dropout=cfg.dropout,
         lang_embed_dim=cfg.lang_embed_dim,
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
-    scaler = GradScaler(enabled=(cfg.fp16 and device == "cuda"))
-    crit = nn.CrossEntropyLoss(ignore_index=pad_idx_dict["phonemes"])
-
-    start_epoch = 0
-    best_val = float("inf")
-    if cfg.resume:
-        resume_path = cfg.resume
-        # allow a bare checkpoint filename to resolve inside run_dir
-        if not os.path.isabs(resume_path) and not os.path.exists(resume_path):
-            resume_path = os.path.join(run_dir, resume_path)
-        print(f"[info] resuming from {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val = ckpt.get("val_loss", float("inf"))
-
-    # per-epoch lr decay (e.g. 0.8 -> lr at epoch e is lr0 * 0.8**e). Created after a
-    # possible resume so its base lr reflects the already-decayed lr from the checkpoint.
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.lr_decay_gamma)
-
-    train_loader = make_loader(train_ds, cfg.batch_size, pad_idx_dict, loader_num_workers, True, loader_pin_memory, cfg.sort_by_length)
-    val_loader = make_loader(val_ds, cfg.batch_size, pad_idx_dict, loader_num_workers, False, loader_pin_memory, cfg.sort_by_length)
-
-    # persist artifacts needed for inference / export
-    src_vocab.to_file(os.path.join(run_dir, "src_vocab.txt"))
-    phoneme_vocab.to_file(os.path.join(run_dir, "phoneme_vocab.txt"))
-    grapheme_tgt_vocab.to_file(os.path.join(run_dir, "grapheme_tgt_vocab.txt"))
-    pp.save_bpe(tokenizer, os.path.join(run_dir, "bpe.txt"))
-    _save_meta(run_dir, meta, cfg)
-
-    use_amp = cfg.fp16 and device == "cuda"
-    global_step = 0
-    for epoch in range(start_epoch, cfg.epochs):
-        t0 = time.time()
-        model.train()
-        running = torch.zeros((), device=device)
-        running_cons = torch.zeros((), device=device)
-        n_batches = 0
-        optimizer.zero_grad(set_to_none=True)
-        pbar = tqdm(train_loader, desc=f"epoch {epoch+1}/{cfg.epochs}", unit="batch")
-        for step, (src, src_len, lang, targets, tgt_lens) in enumerate(pbar):
-            src = src.to(device, non_blocking=True)
-            src_len = src_len.to(device, non_blocking=True)
-            lang = lang.to(device, non_blocking=True)
-            targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
-            tgt_lens = {k: v.to(device, non_blocking=True) for k, v in tgt_lens.items()}
-
-            with autocast(device_type=device, enabled=use_amp):
-                task_loss, cons_loss = _task_and_consistency_loss(
-                    model, src, src_len, lang, targets, tgt_lens, cfg, crit,
-                    phoneme_vocab, grapheme_tgt_vocab, pad_idx_dict, sep_ids,
-                )
-                loss = task_loss + cons_loss
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-            # accumulate detached tensors (NO per-step .item() -> no forced CUDA
-            # sync every step, which would otherwise stall the pipeline and create
-            # the "GPU idle between batches" sawtooth).
-            running = running + loss.detach()
-            running_cons = running_cons + cons_loss.detach()
-            n_batches += 1
-            global_step += 1
-            if cfg.log_every and (step + 1) % cfg.log_every == 0:
-                loss_val = loss.detach().item()
-                cons_val = cons_loss.detach().item()
-                pbar.set_postfix(loss=f"{loss_val:.3f}", cons=f"{cons_val:.3f}")
-                print(f"  epoch {epoch+1} step {step+1} loss={loss_val:.4f} "
-                      f"cons={cons_val:.4f}")
-                # transient loss shown in TensorBoard at the per-step granularity
-                if writer is not None:
-                    writer.add_scalar("loss/step_task", task_loss.detach().item(), global_step)
-                    writer.add_scalar("loss/step_total", loss_val, global_step)
-                    writer.add_scalar("loss/step_cons", cons_val, global_step)
-
-        # validation
-        val_task, val_cons = _evaluate(
-            model, val_loader, crit, device, use_amp, pad_idx_dict,
-            cfg, phoneme_vocab, grapheme_tgt_vocab, sep_ids,
-        )
-        dt = time.time() - t0
-        train_loss_avg = (running / max(n_batches, 1)).item()
-        train_cons_avg = (running_cons / max(n_batches, 1)).item()
-        print(f"[epoch {epoch+1}/{cfg.epochs}] train_loss={train_loss_avg:.4f} "
-              f"train_cons={train_cons_avg:.4f} "
-              f"val_loss={val_task:.4f} val_cons={val_cons:.4f} time={dt:.1f}s")
-
-        # ---- per-epoch lr decay ----
-        scheduler.step()
-        cur_lr = optimizer.param_groups[0]["lr"]
-        print(f"  -> lr = {cur_lr:.3e}")
-        if writer is not None:
-            writer.add_scalar("lr/epoch", cur_lr, epoch)
-
-        # ---- TensorBoard scalars (loss / consistency) ----
-        if writer is not None:
-            writer.add_scalar("loss/train", train_loss_avg, epoch)
-            writer.add_scalar("loss/cons_train", train_cons_avg, epoch)
-            writer.add_scalar("loss/val", val_task, epoch)
-            writer.add_scalar("loss/cons_val", val_cons, epoch)
-
-        # ---- fixed-sample monitoring: every epoch, also dumped at save ----
-        fixed_results: List[Dict] = []
-        if fixed_samples:
-            fixed_results = _infer_fixed_samples(
-                model, fixed_samples, tokenizer, src_vocab, phoneme_vocab,
-                grapheme_tgt_vocab, meta["lang2id"], device, cfg.max_tgt_len,
-            )
-            if writer is not None:
-                writer.add_text("fixed_samples", _render_fixed_text(fixed_results), epoch)
-
-        ckpt = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "val_loss": val_task,
-            "val_cons": val_cons,
-            "config": cfg.to_dict(),
-            "meta": meta,
-        }
-        torch.save(ckpt, os.path.join(run_dir, "ckpt_last.pt"))
-        # synchronize the fixed samples' grapheme -> model predictions with the pt
-        if fixed_results:
-            _write_fixed_predictions(
-                os.path.join(run_dir, "fixed_samples_predictions.txt"), fixed_results
-            )
-        if val_task < best_val:
-            best_val = val_task
-            torch.save(ckpt, os.path.join(run_dir, "ckpt_best.pt"))
-            print(f"  -> saved ckpt_best.pt (val_loss={val_task:.4f} val_cons={val_cons:.4f})")
-
-        # deployment artifact: model weights only (no optimizer) -> stays small
-        if cfg.save_model_only:
-            _save_model_only(os.path.join(run_dir, "model_last.pt"), model, cfg.export_dtype)
-            if val_task < best_val:  # this epoch is a new best -> refresh model_best
-                _save_model_only(os.path.join(run_dir, "model_best.pt"), model, cfg.export_dtype)
-
-    if writer is not None:
-        writer.close()
-
-    print("[done] training complete. Best checkpoint at",
-          os.path.join(run_dir, "ckpt_best.pt"))
+    return model
 
 
-def _task_and_consistency_loss(model, src, src_len, lang, targets, tgt_lens,
-                                cfg, crit, phoneme_vocab, grapheme_tgt_vocab,
-                                pad_idx_dict, sep_ids):
-    """Return ``(task_loss, cons_loss)`` on already device-moved tensors."""
-    logits = model(src, src_len, lang, targets, tgt_lens)
-    task_loss = torch.zeros((), device=src.device)
-    for name in TARGET_NAMES:
-        lg = logits[name].permute(1, 0, 2)  # [B, T, V]
-        tgt = targets[name]                # [B, T]
-        # decoder at position i predicts tgt[i+1] -> shift target
-        task_loss = task_loss + crit(
-            lg[:, :-1].reshape(-1, lg.size(-1)),
-            tgt[:, 1:].reshape(-1),
-        )
+def reconstruct_prediction(src_units, phoneme_tokens, counts, task, vowel_set=None):
+    """Turn predicted counts back into the separator-joined string for monitoring.
 
-    cons_loss = torch.zeros((), device=src.device)
-    if cfg.consistency_weight or cfg.grapheme_consistency_weight:
-        pipe_id, slash_id, graph_id, space_id = sep_ids
-        eos_ph = phoneme_vocab.eos_idx
-        eos_gr = grapheme_tgt_vocab.eos_idx
-        c_ph = (
-            phoneme_consistency(logits["phonemes"], logits["separated_phonemes"],
-                                targets["separated_phonemes"], pipe_id,
-                                pad_idx_dict["phonemes"], eos_ph, space_id=space_id)
-            + phoneme_consistency(logits["phonemes"], logits["aligned_phonemes"],
-                                  targets["aligned_phonemes"], slash_id,
-                                  pad_idx_dict["phonemes"], eos_ph, space_id=space_id)
-        ) * 0.5
-        c_gr = grapheme_consistency(
-            logits["separated_graphmes"], targets["separated_graphmes"], graph_id,
-            pad_idx_dict["separated_graphmes"], len(grapheme_tgt_vocab), eos_gr,
-            space_id=space_id,
-        )
-        cons_loss = cfg.consistency_weight * c_ph + cfg.grapheme_consistency_weight * c_gr
-    return task_loss, cons_loss
+    When ``vowel_set`` is given (a CJK-like language with one-char-one-syllable),
+    the phoneme-group tasks are re-segmented by vowel nucleus instead of trusting
+    the count head -- which is exactly what inference does, so the training log
+    shows the same corrected output the user will actually get.
+    """
+    sep, unit = SEP_UNIT[task]
+    if task == "separated_graphmes":
+        base = src_units
+    else:
+        base = phoneme_tokens
+    if vowel_set is not None and task in ("separated_phonemes", "aligned_phonemes"):
+        return resegment_by_vowels(base, vowel_set, sep, unit)
+    return reconstruct_groups(base, counts, sep, unit)
 
 
-@torch.no_grad()
-def _evaluate(model, loader, crit, device, use_amp, pad_idx_dict, cfg,
-              phoneme_vocab, grapheme_tgt_vocab, sep_ids):
-    model.eval()
-    total = torch.zeros((), device=device)
-    cons_total = torch.zeros((), device=device)
-    n = 0
-    for src, src_len, lang, targets, tgt_lens in tqdm(loader, desc="eval", unit="batch", leave=False):
-        src = src.to(device, non_blocking=True)
-        src_len = src_len.to(device, non_blocking=True)
-        lang = lang.to(device, non_blocking=True)
-        targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
-        tgt_lens = {k: v.to(device, non_blocking=True) for k, v in tgt_lens.items()}
-        with autocast(device_type=device, enabled=use_amp):
-            task_loss, cons_loss = _task_and_consistency_loss(
-                model, src, src_len, lang, targets, tgt_lens, cfg, crit,
-                phoneme_vocab, grapheme_tgt_vocab, pad_idx_dict, sep_ids,
-            )
-        total = total + task_loss.detach()
-        cons_total = cons_total + cons_loss.detach()
-        n += 1
-    return (total / max(n, 1)).item(), (cons_total / max(n, 1)).item()
+def counts_from_ids(ids, count_codec):
+    return count_codec.decode([int(i) for i in ids])
 
 
-def _save_model_only(path: str, model, dtype: str) -> None:
-    """Write a deployment checkpoint with model weights only (no optimizer).
+def _deploy_state(model, dtype: str) -> dict:
+    """Return a weights-only checkpoint, optionally downcast to fp16.
 
-    Kept tiny so it fits comfortably under typical size budgets (e.g. 20 MB):
-    fp32 ~ params*4 bytes, fp16 ~ params*2 bytes.  ``inference.py`` / ONNX
-    export consume this together with the vocab files already in ``run_dir``.
+    The exported key is ``dtype`` (not ``export_dtype``) so that
+    :func:`src.utils.load_model_weights` can detect and recast an fp16 file.
     """
     sd = model.state_dict()
     if dtype == "fp16":
         sd = {k: v.half() for k, v in sd.items()}
-    torch.save({"model": sd, "dtype": dtype}, path)
+    return {"model": sd, "dtype": dtype}
 
 
-def _save_meta(output_dir, meta, cfg):
-    import json
-    with open(os.path.join(output_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                # lang / length info
-                "lang2id": meta["lang2id"],
-                "id2lang": {str(k): v for k, v in meta["id2lang"].items()},
-                "max_src_len": cfg.max_src_len, "max_tgt_len": cfg.max_tgt_len,
-                "lang_embed_dim": cfg.lang_embed_dim,
-                # vocab sizes (needed to (re)build the model from this file alone)
-                "src_vocab_size": meta["src_vocab_size"],
-                "phoneme_vocab_size": meta["phoneme_vocab_size"],
-                "grapheme_tgt_vocab_size": meta["grapheme_tgt_vocab_size"],
-                "num_langs": meta["num_langs"],
-                # architecture (lets inference/export rebuild without the full ckpt)
-                "embed_dim": cfg.embed_dim, "enc_layers": cfg.enc_layers,
-                "dec_layers": cfg.dec_layers, "enc_heads": cfg.enc_heads,
-                "dec_hidden": cfg.dec_hidden, "ffn_dim": cfg.ffn_dim,
-            },
-            f, ensure_ascii=False, indent=2,
-        )
-    cfg.save(os.path.join(output_dir, "config.yaml"))
+def main():
+    # All CLI flags (--config, --device, --force_rebinarize, --max_samples, ...)
+    # are registered by build_config(); train.py itself adds no argparse parser.
+    cfg = build_config()
+    # resolve the binary dir (data artifacts: vocab/codec/npz) and the run dir
+    # (training artifacts: checkpoints + tensorboard). These are intentionally
+    # separate: data lives under {data_dir}/binary; training outputs go to
+    # {output_dir}/{model_name} (config-driven, never hardcoded).
+    if cfg.binary_dir is None:
+        cfg.binary_dir = os.path.join(cfg.data_dir, "binary")
+    device = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    need_bin = cfg.force_rebinarize or not os.path.exists(
+        os.path.join(cfg.binary_dir, "meta.json"))
+    if need_bin:
+        print(f"[binarize] building {cfg.binary_dir} from {cfg.data_dir} "
+              f"({cfg.file_glob}, max_samples={cfg.max_samples}) ...")
+        run_binarize(cfg, cfg.binary_dir)
+    else:
+        print(f"[binarize] reusing existing {cfg.binary_dir}")
+
+    (train_ds, val_ds, src_vocab, phoneme_vocab, count_codec, tokenizer,
+     pad_idx_dict, meta, val_monitor) = load_binary(cfg.binary_dir)
+
+    print(f"[vocab] src={len(src_vocab)} phoneme={len(phoneme_vocab)} "
+          f"count={count_codec.vocab_size} (max_count={count_codec.max_count}) "
+          f"langs={meta['num_langs']}")
+
+    # ---- structural constraint metadata (one vowel nucleus per syllable) ----
+    # Derived in binarize from the aligned groups; lets us both fix the phoneme
+    # separators at inference/monitor time and report a violation diagnostic.
+    vowel_symbols = meta.get("vowel_phonemes") or {}
+    syllable_is_char = meta.get("syllable_is_char") or {}
+    # boolean mask over lang ids: which languages are one-char-one-syllable
+    # NOTE: JSON round-trips dict keys to strings, so `id2lang` comes back keyed
+    # by "0" (str) rather than 0 (int); coerce before indexing by lang id.
+    id2lang = {int(k): v for k, v in meta["id2lang"].items()}
+    syllable_lang_mask = torch.tensor(
+        [bool(syllable_is_char.get(id2lang[i], False))
+         for i in range(meta["num_langs"])],
+        dtype=torch.bool)
+    # global set of vowel phoneme vocab-ids (diagnostic only; the mask gates it)
+    all_vowel_ids = set()
+    for _lang, _syms in vowel_symbols.items():
+        for _s in _syms:
+            _idx = phoneme_vocab.stoi(_s)
+            if _idx is not None:
+                all_vowel_ids.add(_idx)
+    use_syllable_aux = cfg.syllable_constraint_weight > 0 and bool(all_vowel_ids)
+    if use_syllable_aux:
+        print(f"[syllable] constraining separators for {len(all_vowel_ids)} vowel ids; "
+              f"languages={[l for l, v in syllable_is_char.items() if v]}")
+
+    model = build_model(cfg, meta, count_codec.vocab_size).to(device)
+
+    # ---- run (training artifact) directory ----
+    run_dir = os.path.join(cfg.output_dir, cfg.model_name)
+    ckpt_dir = os.path.join(run_dir, "ckpt")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    tb_dir = cfg.tb_log_dir or os.path.join(run_dir, "tb-logs")
+    cfg.save(os.path.join(run_dir, "config.yaml"))
+
+    # pin_memory is enabled for the train loader when on CUDA (and the dataset is
+    # host-resident), which lets the H2D copies below run with non_blocking=True.
+    pin_memory = device != "cpu" and not cfg.data_on_gpu
+    non_blocking = pin_memory
+    loader = make_loader(
+        train_ds, cfg.batch_size, pad_idx_dict,
+        num_workers=0 if cfg.data_on_gpu else cfg.num_workers,
+        shuffle=True,
+        pin_memory=pin_memory)
+    val_loader = make_loader(val_ds, cfg.batch_size, pad_idx_dict, 0, shuffle=False,
+                             pin_memory=False)
+
+    optim = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode="min", factor=0.5, patience=2)
+
+    # ---- optional mixed precision (AMP) ----
+    use_amp = bool(cfg.fp16) and device == "cuda"
+    if use_amp:
+        print("[amp] training with mixed precision (fp16)")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # ---- tensorboard (only if enabled) ----
+    writer = SummaryWriter(log_dir=tb_dir) if cfg.tensorboard else None
+
+    # ---- fixed val samples (deterministic across runs via seeded RNG) ----
+    if cfg.num_fixed_samples and len(val_monitor) > 0:
+        _rng = random.Random(cfg.fixed_samples_seed)
+        fixed_samples = _rng.sample(val_monitor, min(cfg.num_fixed_samples, len(val_monitor)))
+    else:
+        fixed_samples = val_monitor[:min(5, len(val_monitor))]
+
+    # ---- optionally keep the whole dataset resident on CUDA ----
+    if cfg.data_on_gpu and device.startswith("cuda"):
+        print(f"[data_on_gpu] uploading dataset to {device} ...")
+        train_ds.to_device(device)
+        val_ds.to_device(device)
+
+    start_epoch = 1
+    best_val = float("inf")
+    if cfg.resume and os.path.exists(cfg.resume):
+        ck = torch.load(cfg.resume, map_location=device)
+        model.load_state_dict(ck["model"])
+        optim.load_state_dict(ck["optim"])
+        start_epoch = ck.get("epoch", 1) + 1
+        best_val = ck.get("best_val", best_val)
+        print(f"[resume] epoch {start_epoch-1} from {cfg.resume}")
+
+    global_step = 0
+    for epoch in range(start_epoch, cfg.epochs + 1):
+        t0 = time.time()
+        model.train()
+        # Accumulate the loss as a (detached) tensor and only convert to a Python
+        # number at the end of the epoch.  `float(loss.detach())` each step would
+        # force a device->host sync every batch, stalling the GPU pipeline.
+        running = torch.zeros((), device=device)
+        nbatches = 0
+        train_iter = tqdm(loader, desc=f"epoch {epoch}", unit="batch",
+                          leave=False) if tqdm is not None else loader
+        for src, src_len, lang, targets, tgt_lens in train_iter:
+            src = src.to(device, non_blocking=non_blocking)
+            lang = lang.to(device, non_blocking=non_blocking)
+            targets = {k: v.to(device, non_blocking=non_blocking) for k, v in targets.items()}
+            tgt_lens = {k: v.to(device, non_blocking=non_blocking) for k, v in tgt_lens.items()}
+            src_len = src_len.to(device, non_blocking=non_blocking)
+
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                loss, parts = model(
+                    src, src_len, lang, targets, tgt_lens, pad_idx_dict,
+                    vowel_ids=all_vowel_ids if use_syllable_aux else None,
+                    syllable_lang_mask=syllable_lang_mask if use_syllable_aux else None,
+                    syllable_constraint_weight=cfg.syllable_constraint_weight,
+                )
+            optim.zero_grad()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                optim.step()
+
+            running += loss.detach()
+            nbatches += 1
+            global_step += 1
+            if writer is not None and (cfg.log_every <= 0 or global_step % cfg.log_every == 0):
+                for t, v in parts.items():
+                    writer.add_scalar(f"train/{t}", float(v.detach()), global_step)
+                if tqdm is not None:
+                    train_iter.set_postfix(loss=f"{running.item() / nbatches:.4f}")
+
+        train_loss = running.item() / max(1, nbatches)
+
+        # ---- validation ----
+        model.eval()
+        vrunning = torch.zeros((), device=device)
+        vbatches = 0
+        val_iter = tqdm(val_loader, desc="val", unit="batch",
+                        leave=False) if tqdm is not None else val_loader
+        with torch.no_grad():
+            for src, src_len, lang, targets, tgt_lens in val_iter:
+                src = src.to(device)
+                lang = lang.to(device)
+                targets = {k: v.to(device) for k, v in targets.items()}
+                tgt_lens = {k: v.to(device) for k, v in tgt_lens.items()}
+                src_len = src_len.to(device)
+                with torch.amp.autocast('cuda', enabled=use_amp):
+                    loss, parts = model(src, src_len, lang, targets, tgt_lens, pad_idx_dict)
+                vrunning += loss.detach()
+                vbatches += 1
+        val_loss = vrunning.item() / max(1, vbatches)
+        scheduler.step(val_loss)
+
+        dt = time.time() - t0
+        print(f"[epoch {epoch}] train={train_loss:.4f} val={val_loss:.4f} "
+              f"time={dt:.1f}s lr={optim.param_groups[0]['lr']:.5f}")
+
+        # ---- fixed-sample inspection: reconstruct strings from predicted counts ----
+        with torch.no_grad():
+            sample = fixed_samples
+            if sample:
+                inp = []
+                for m in sample:
+                    units = tokenizer.tokenize(m["text"])
+                    inp.append((units, src_vocab.encode(units)))
+                maxlen = max(len(u) for u, _ in inp)
+                src_t = torch.tensor([e + [0] * (maxlen - len(e)) for _, e in inp],
+                                     dtype=torch.long, device=device).transpose(0, 1)
+                src_len_t = torch.tensor([len(e) for _, e in inp], dtype=torch.long,
+                                         device=device)
+                lang_t = torch.tensor([meta["lang2id"][m["lang"]] for m in sample],
+                                      dtype=torch.long, device=device)
+                out = model.generate(src_t, src_len_t, lang_t, cfg.max_tgt_len, 1)
+                for i, m in enumerate(sample):
+                    ph_ids = out["phonemes"][i].tolist()
+                    ph_ids = [x for x in ph_ids if x not in (0, 1, 2)]
+                    ph_tokens = phoneme_vocab.decode(ph_ids)
+                    ph_str = " ".join(ph_tokens)
+                    line = f"    {m['text']} -> phonemes: {ph_str}"
+                    for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
+                        counts = counts_from_ids(out[task][i].tolist(), count_codec)
+                        vset = None
+                        if task in ("separated_phonemes", "aligned_phonemes"):
+                            mlang = m["lang"]
+                            if syllable_is_char.get(mlang) and mlang in vowel_symbols:
+                                vset = set(vowel_symbols[mlang])
+                        recon = reconstruct_prediction(
+                            tokenizer.tokenize(m["text"]), ph_tokens, counts, task,
+                            vowel_set=vset)
+                        line += f" | {task}: {recon}"
+                    print(line)
+
+        # ---- checkpoint ----
+        # best is always persisted (resumable: model + optim + meta). Intermediate
+        # epoch checkpoints are gated by save_every (0 => never, only best+last).
+        improved = val_loss < best_val
+        if improved:
+            best_val = val_loss
+            torch.save({
+                "model": model.state_dict(),
+                "optim": optim.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+                "config": cfg.to_dict(),
+                "meta": meta,
+            }, os.path.join(ckpt_dir, "best_model.pt"))
+        if cfg.save_every > 0 and (epoch % cfg.save_every == 0 or epoch == cfg.epochs):
+            torch.save({
+                "model": model.state_dict(),
+                "optim": optim.state_dict(),
+                "epoch": epoch,
+                "best_val": best_val,
+                "config": cfg.to_dict(),
+                "meta": meta,
+            }, os.path.join(ckpt_dir, f"epoch_{epoch}.pt"))
+        # light-weight deploy artifacts (weights only, optional fp16)
+        if cfg.save_model_only:
+            if improved:
+                torch.save(_deploy_state(model, cfg.export_dtype),
+                           os.path.join(ckpt_dir, "model_best.pt"))
+            torch.save(_deploy_state(model, cfg.export_dtype),
+                       os.path.join(ckpt_dir, "model_last.pt"))
+        if writer is not None:
+            writer.add_scalar("val/loss", val_loss, epoch)
+            writer.add_scalar("lr", optim.param_groups[0]["lr"], epoch)
+
+    if writer is not None:
+        writer.close()
+    print(f"[done] best_val={best_val:.4f}")
 
 
 if __name__ == "__main__":

@@ -1,294 +1,236 @@
-"""Inference CLI -- works with a PyTorch checkpoint or an exported ONNX model.
+"""Inference helpers: reconstruct the four G2P fields from a trained model.
 
-Examples
---------
-PyTorch:
-    python src/inference.py --checkpoint checkpoints/ckpt_best.pt --lang ko --text "안녕하세요"
-
-ONNX:
-    python src/inference.py --onnx g2p_multitask.onnx --lang ko --text "안녕하세요"
-    python src/inference.py --onnx g2p_multitask.onnx --lang en --input-file phrases.txt
+The model emits token *ids* per task.  ``phonemes`` ids are decoded by the
+phoneme vocab; the three derived tasks emit *count* ids which are turned into
+the separator-joined strings via :func:`src.preprocessing.reconstruct_groups`,
+regrouping the appropriate base sequence (source units for ``separated_graphmes``,
+predicted phoneme tokens for ``separated_/aligned_phonemes``).
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
-from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
 import torch
 
-from src import preprocessing as pp
-from src.utils import greedy_decode
+from src.model import G2PModel
+from src.preprocessing import (
+    PIPE,
+    SLASH,
+    load_bpe,
+    reconstruct_groups,
+    resegment_by_vowels,
+)
+from src.utils import load_model_weights
+
+SEP_UNIT = {
+    "separated_graphmes": ("|", ""),
+    "separated_phonemes": ("|", " "),
+    "aligned_phonemes": ("/", " "),
+}
 
 
-# --------------------------------------------------------------------------- #
-# Artifact loading
-# --------------------------------------------------------------------------- #
-def load_artifacts(vocab_dir: str):
-    tokenizer = pp.load_bpe(os.path.join(vocab_dir, "bpe.txt"))
-    src_vocab = pp.Vocab.from_file(os.path.join(vocab_dir, "src_vocab.txt"))
-    phoneme_vocab = pp.Vocab.from_file(os.path.join(vocab_dir, "phoneme_vocab.txt"))
-    grapheme_tgt_vocab = pp.Vocab.from_file(os.path.join(vocab_dir, "grapheme_tgt_vocab.txt"))
-    import json
-    with open(os.path.join(vocab_dir, "meta.json"), encoding="utf-8") as f:
-        meta = json.load(f)
-    lang2id = meta["lang2id"]
-    return tokenizer, src_vocab, phoneme_vocab, grapheme_tgt_vocab, lang2id, meta
+def _resolve_binary_dir(binary_dir: str) -> str:
+    """Pick a binary dir that actually contains ``meta.json``.
 
-
-def _prepare_batch(texts, lang, tokenizer, src_vocab, lang2id, device):
-    if lang not in lang2id:
-        raise ValueError(f"unknown language {lang!r}; known: {sorted(lang2id)}")
-    lang_id = lang2id[lang]
-    units_list = [tokenizer.tokenize(t) for t in texts]
-    ids_list = [src_vocab.encode(u) for u in units_list]
-    max_len = max((len(i) for i in ids_list), default=1)
-    max_len = max(max_len, 1)
-    padded = torch.full((len(ids_list), max_len), src_vocab.pad_idx, dtype=torch.long)
-    src_lens = torch.zeros(len(ids_list), dtype=torch.long)
-    for i, ids in enumerate(ids_list):
-        if len(ids) == 0:
-            ids = [src_vocab.unk_idx]
-        padded[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-        src_lens[i] = len(ids)
-    lang_ids = torch.full((len(texts),), lang_id, dtype=torch.long)
-    return padded.to(device), src_lens.to(device), lang_ids.to(device)
-
-
-def _decode_outputs(preds: Dict[str, List[List[int]]], vocab_map) -> List[Dict[str, str]]:
-    """preds: task -> list of token-id lists (per sample). Build readable strings."""
-    out: List[Dict[str, str]] = []
-    n = len(next(iter(preds.values())))
-    for i in range(n):
-        d = {}
-        for task, vocab in vocab_map.items():
-            toks = preds[task][i]
-            syms = [
-                vocab.itos(t)
-                for t in toks
-                if t not in (vocab.pad_idx, vocab.eos_idx, vocab.sos_idx)
-            ]
-            # bare phonemes has no in-string separator -> re-insert spaces to
-            # match the CSV; separated_*/aligned_* already carry | and /.
-            sep = " " if task == "phonemes" else ""
-            d[task] = sep.join(syms)
-        out.append(d)
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# PyTorch inferer
-# --------------------------------------------------------------------------- #
-class PyTorchInferer:
-    def __init__(self, checkpoint: str, vocab_dir: str, device: str = "cpu"):
-        from src.utils import load_model_weights
-        self.tokenizer, self.src_vocab, self.phoneme_vocab, self.grapheme_tgt_vocab, \
-            self.lang2id, self.meta = load_artifacts(vocab_dir)
-        ckpt = torch.load(checkpoint, map_location=device)
-        if "config" in ckpt and "meta" in ckpt:
-            # full training checkpoint: build from its embedded config/meta
-            self.model = _build_model(ckpt["config"], ckpt["meta"]).to(device)
-            load_model_weights(checkpoint, self.model, device)
-        else:
-            # weights-only deployment file (model_best/model_last.pt):
-            # rebuild from the meta.json in vocab_dir, then load weights
-            self.model = _build_model(self.meta, self.meta).to(device)
-            load_model_weights(checkpoint, self.model, device)
-        self.model.eval()
-        self.device = device
-        self.vocab_map = {
-            "phonemes": self.phoneme_vocab,
-            "separated_graphmes": self.grapheme_tgt_vocab,
-            "separated_phonemes": self.phoneme_vocab,
-            "aligned_phonemes": self.phoneme_vocab,
-        }
-
-    @torch.no_grad()
-    def run(self, texts: List[str], lang: str, max_len: int = 80) -> List[Dict[str, str]]:
-        src, src_lens, lang_ids = _prepare_batch(
-            texts, lang, self.tokenizer, self.src_vocab, self.lang2id, self.device
-        )
-        src_t = src.transpose(0, 1).contiguous()
-        logits = self.model.generate(src_t, src_lens, lang_ids, max_len, sos_idx=1)
-        # model.generate returns [T, B, V]; greedy_decode expects [B, T, V]
-        logits = {k: v.transpose(0, 1).contiguous() for k, v in logits.items()}
-        preds: Dict[str, List[List[int]]] = {}
-        for task in logits:
-            decoded = greedy_decode(logits[task], eos_idx=2, pad_idx=0)  # 2=EOS
-            preds[task] = decoded
-        return _decode_outputs(preds, self.vocab_map)
-
-
-# --------------------------------------------------------------------------- #
-# ONNX inferer
-# --------------------------------------------------------------------------- #
-class ONNXInferer:
-    """Drives any exported ``G2PModel`` graph (any language / phoneme scheme).
-
-    The four output names are fixed and identical across all exports
-    (``phonemes``, ``separated_graphmes``, ``separated_phonemes``,
-    ``aligned_phonemes``), so this single class works for every ONNX produced by
-    :mod:`src.export_onnx`.  The only data-dependent dimension is ``V`` (the last
-    dim of each output), which is baked into the graph weights -- therefore each
-    ONNX must be paired with its own vocab directory.  We verify that contract via
-    the ``metadata_props`` embedded at export time and raise if it does not match.
+    The command-line default (``data/binary``) is a placeholder; the real output
+    lives under ``<data_dir>/binary`` (e.g. ``data/Korean/binary``).  If the given
+    path has no ``meta.json``, fall back to a few common locations so a bare
+    ``python -m src.inference --text ...`` works without guessing the path.
     """
-
-    OUTPUT_NAMES = ["phonemes", "separated_graphmes", "separated_phonemes", "aligned_phonemes"]
-
-    def __init__(self, onnx_path: str, vocab_dir: str, device: str = "cpu"):
-        import onnxruntime as ort
-        self.tokenizer, self.src_vocab, self.phoneme_vocab, self.grapheme_tgt_vocab, \
-            self.lang2id, self.meta = load_artifacts(vocab_dir)
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            providers=(
-                ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                if device.startswith("cuda") and "CUDAExecutionProvider" in ort.get_available_providers()
-                else ["CPUExecutionProvider"]
-            ),
-        )
-        self.device = device
-        self.vocab_map = {
-            "phonemes": self.phoneme_vocab,
-            "separated_graphmes": self.grapheme_tgt_vocab,
-            "separated_phonemes": self.phoneme_vocab,
-            "aligned_phonemes": self.phoneme_vocab,
-        }
-        self.meta_props = self._read_metadata(onnx_path)
-        self._verify_compat()
-
-    # ---- metadata / compatibility check ---------------------------------- #
-    def _read_metadata(self, onnx_path: str) -> Dict[str, str]:
-        import onnx
-
-        try:
-            m = onnx.load(onnx_path)
-        except Exception:
-            return {}
-        return {p.key: p.value for p in m.metadata_props}
-
-    def _verify_compat(self) -> None:
-        mp = self.meta_props
-        if not mp:
-            # legacy export without metadata: trust the vocab dir silently.
-            return
-        expected = {
-            "g2p.src_vocab_size": len(self.src_vocab),
-            "g2p.phoneme_vocab_size": len(self.phoneme_vocab),
-            "g2p.grapheme_tgt_vocab_size": len(self.grapheme_tgt_vocab),
-            "g2p.num_langs": len(self.lang2id),
-        }
-        mism = [
-            f"{k}={mp[k]} but vocab has {expected[k]}"
-            for k, v in expected.items()
-            if v != int(mp[k])
-        ]
-        if mism:
-            raise ValueError(
-                "ONNX vocab contract mismatch -- this .onnx is paired with the "
-                "wrong vocab_dir. " + "; ".join(mism)
-            )
-        # expose the graph's own max_len for the caller
-        self.max_len_graph = int(mp.get("g2p.max_len", 80))
-        self.eos_idx_graph = int(mp.get("g2p.eos_idx", 2))
-
-    def run(self, texts: List[str], lang: str, max_len: int = 80) -> List[Dict[str, str]]:
-        max_len = min(max_len, getattr(self, "max_len_graph", max_len))
-        src, src_lens, lang_ids = _prepare_batch(
-            texts, lang, self.tokenizer, self.src_vocab, self.lang2id, "cpu"
-        )
-        feeds = {
-            "graphemes": src.numpy().astype(np.int64),
-            "src_lens": src_lens.numpy().astype(np.int64),
-            "langs": lang_ids.numpy().astype(np.int64),
-        }
-        outs = self.sess.run(self.OUTPUT_NAMES, feeds)
-        preds: Dict[str, List[List[int]]] = {}
-        eos_idx = getattr(self, "eos_idx_graph", 2)
-        for name, arr in zip(self.OUTPUT_NAMES, outs):
-            arr = np.argmax(arr, axis=-1)  # [B, T]
-            preds[name] = [list(row) for row in arr]
-        return _decode_outputs(preds, self.vocab_map)
+    if os.path.exists(os.path.join(binary_dir, "meta.json")):
+        return binary_dir
+    candidates = [
+        binary_dir,
+        os.path.join("data", "Korean", "binary"),
+        os.path.join("data", "binary", "binary"),
+        "data/binary",
+    ]
+    for c in candidates:
+        if os.path.exists(os.path.join(c, "meta.json")):
+            print(f"[inference] '{binary_dir}' has no meta.json; using '{c}'")
+            return c
+    return binary_dir  # give up; let the original error surface
 
 
-# --------------------------------------------------------------------------- #
-# model factory
-# --------------------------------------------------------------------------- #
-def _build_model(cfg_d, meta):
-    from src.model import G2PModel
-    return G2PModel(
+def _resolve_model_path(binary_dir: str, model_dir: str = None) -> str:
+    """Pick the checkpoint file holding the trained weights.
+
+    Training now writes the full checkpoint to ``{output_dir}/{model_name}/ckpt``
+    (config-driven).  When ``model_dir`` is given, prefer ``best_model.pt`` there,
+    falling back to the deployment-only ``model_best.pt``; otherwise fall back to
+    the legacy ``{binary_dir}/best_model.pt`` for backwards compatibility.
+    """
+    if model_dir:
+        best = os.path.join(model_dir, "best_model.pt")
+        if os.path.exists(best):
+            return best
+        alt = os.path.join(model_dir, "model_best.pt")
+        if os.path.exists(alt):
+            return alt
+    return os.path.join(binary_dir, "best_model.pt")
+
+
+def load_inferer(binary_dir: str, model_dir: str = None, device: str = "cpu"):
+    binary_dir = _resolve_binary_dir(binary_dir)
+    with open(os.path.join(binary_dir, "meta.json"), "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    model = G2PModel(
         src_vocab_size=meta["src_vocab_size"],
         phoneme_vocab_size=meta["phoneme_vocab_size"],
-        grapheme_tgt_vocab_size=meta["grapheme_tgt_vocab_size"],
+        count_vocab_size=meta["count_vocab_size"],
         num_langs=meta["num_langs"],
-        embed_dim=cfg_d["embed_dim"],
-        enc_layers=cfg_d["enc_layers"],
-        dec_layers=cfg_d["dec_layers"],
-        enc_heads=cfg_d["enc_heads"],
-        dec_hidden=cfg_d["dec_hidden"],
-        ffn_dim=cfg_d["ffn_dim"],
+        embed_dim=meta["embed_dim"],
+        enc_layers=meta["enc_layers"],
+        dec_layers=meta["dec_layers"],
+        enc_heads=meta["enc_heads"],
+        dec_hidden=meta["dec_hidden"],
+        ffn_dim=meta["ffn_dim"],
         dropout=0.0,
-        lang_embed_dim=cfg_d["lang_embed_dim"],
+        lang_embed_dim=meta["lang_embed_dim"],
     )
+    load_model_weights(_resolve_model_path(binary_dir, model_dir), model, device)
+    model.to(device).eval()
+    return Inferer(model, binary_dir, meta, device)
+
+
+class Inferer:
+    def __init__(self, model: G2PModel, binary_dir: str, meta: dict, device: str):
+        self.model = model
+        self.meta = meta
+        self.device = device
+        self.lang2id = meta["lang2id"]
+        # load src vocab + bpe + phoneme vocab + count codec
+        from src.bin_data import (  # noqa: F401
+            load_src_vocab, load_phoneme_vocab, load_count_codec,
+        )
+        self.src_vocab = load_src_vocab(os.path.join(binary_dir, "src_vocab.txt"))
+        self.phoneme_vocab = load_phoneme_vocab(os.path.join(binary_dir, "phoneme_vocab.txt"))
+        self.count_codec = load_count_codec(meta)
+        self.tokenizer = load_bpe(os.path.join(binary_dir, "bpe.txt")) \
+            if os.path.exists(os.path.join(binary_dir, "bpe.txt")) else None
+        if self.tokenizer is None:
+            from src.preprocessing import build_source_vocab
+            self.tokenizer, _ = build_source_vocab(self.src_vocab.symbols())
+        # structural constraint metadata (one vowel nucleus per syllable)
+        self.vowel_symbols = meta.get("vowel_phonemes") or {}
+        self.syllable_is_char = meta.get("syllable_is_char") or {}
+
+    def predict(self, grapheme_text: str, lang: str,
+                tasks=None, max_len: int = None):
+        if tasks is None:
+            tasks = ["phonemes", "separated_graphmes", "separated_phonemes", "aligned_phonemes"]
+        # Match the length budget used during training (cfg.max_tgt_len) so long
+        # inputs are not truncated earlier in inference than they were at
+        # validation time -- otherwise inference would drop trailing separators
+        # that the training val monitor still produced.
+        if max_len is None:
+            max_len = self.meta.get("max_tgt_len", 80)
+        lang_id = self.lang2id.get(lang, 0)
+        units = self.tokenizer.tokenize(grapheme_text)
+        if not units:
+            return {t: "" for t in tasks}
+        src_ids = self.src_vocab.encode(units)
+        src_t = torch.tensor([src_ids], dtype=torch.long, device=self.device).transpose(0, 1)
+        src_len_t = torch.tensor([len(src_ids)], dtype=torch.long, device=self.device)
+        lang_t = torch.tensor([lang_id], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            out = self.model.generate(src_t, src_len_t, lang_t, max_len, 1)
+        result = {}
+        # phonemes first (other tasks regroup it)
+        ph_ids = out["phonemes"][0].tolist()
+        ph_ids = [x for x in ph_ids if x not in (0, 1, 2)]
+        ph_tokens = self.phoneme_vocab.decode(ph_ids)
+        result["phonemes"] = " ".join(ph_tokens)
+        for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
+            if task not in tasks:
+                continue
+            sep, unit = SEP_UNIT[task]
+            # For one-char-one-syllable languages, re-segment the (correct) phoneme
+            # sequence by vowel nucleus instead of trusting the count head -- this
+            # guarantees each `|`/`/` group has exactly one vowel, fixing the
+            # separator errors the count heads under-fit.
+            if (task in ("separated_phonemes", "aligned_phonemes")
+                    and self.syllable_is_char.get(lang)
+                    and lang in self.vowel_symbols and self.vowel_symbols[lang]):
+                result[task] = resegment_by_vowels(
+                    ph_tokens, set(self.vowel_symbols[lang]), sep, unit)
+            else:
+                counts = self.count_codec.decode([int(i) for i in out[task][0].tolist()])
+                base = units if task == "separated_graphmes" else ph_tokens
+                result[task] = reconstruct_groups(base, counts, sep, unit)
+        return result
 
 
 # --------------------------------------------------------------------------- #
-# CLI
+# ONNX-backed inferer (same contract, runs the exported graph)
 # --------------------------------------------------------------------------- #
-def main():
-    # Ensure UTF-8 stdout so non-ASCII text (e.g. Korean) prints correctly on
-    # Windows consoles whose default encoding is GBK.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+class ONNXInferer:
+    def __init__(self, onnx_path: str, binary_dir: str):
+        import onnxruntime as ort
+        import numpy as np
+        self.np = np
+        self.session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        with open(os.path.join(binary_dir, "meta.json"), "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        self.meta = meta
+        self.lang2id = meta["lang2id"]
+        from src.bin_data import load_src_vocab, load_phoneme_vocab, load_count_codec
+        self.src_vocab = load_src_vocab(os.path.join(binary_dir, "src_vocab.txt"))
+        self.phoneme_vocab = load_phoneme_vocab(os.path.join(binary_dir, "phoneme_vocab.txt"))
+        self.count_codec = load_count_codec(meta)
+        self.tokenizer = load_bpe(os.path.join(binary_dir, "bpe.txt")) \
+            if os.path.exists(os.path.join(binary_dir, "bpe.txt")) else None
+        if self.tokenizer is None:
+            from src.preprocessing import build_source_vocab
+            self.tokenizer, _ = build_source_vocab(self.src_vocab.symbols())
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=None)
-    ap.add_argument("--onnx", default=None)
-    ap.add_argument("--vocab_dir", default=None, help="dir with exported vocabs; defaults to checkpoint dir")
-    ap.add_argument("--lang", required=True)
-    ap.add_argument("--text", default=None)
-    ap.add_argument("--input-file", default=None)
-    ap.add_argument("--device", default="cpu")
-    ap.add_argument("--max_len", type=int, default=80)
-    ap.add_argument("--json", action="store_true", help="emit JSON")
-    args = ap.parse_args()
-
-    assert args.checkpoint or args.onnx, "provide --checkpoint or --onnx"
-
-    if args.onnx:
-        vocab_dir = args.vocab_dir or os.path.dirname(os.path.abspath(args.onnx))
-        inferer = ONNXInferer(args.onnx, vocab_dir)
-    else:
-        vocab_dir = args.vocab_dir or os.path.dirname(os.path.abspath(args.checkpoint))
-        inferer = PyTorchInferer(args.checkpoint, vocab_dir, device=args.device)
-
-    if args.input_file:
-        with open(args.input_file, encoding="utf-8") as f:
-            texts = [line.rstrip("\n") for line in f if line.strip()]
-    else:
-        texts = [args.text] if args.text else []
-
-    results = inferer.run(texts, args.lang, max_len=args.max_len)
-
-    if args.json:
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-    else:
-        for text, r in zip(texts, results):
-            print(f"input ({args.lang}): {text}")
-            print(f"  phonemes          : {r['phonemes']}")
-            print(f"  separated_graphmes: {r['separated_graphmes']}")
-            print(f"  separated_phonemes: {r['separated_phonemes']}")
-            print(f"  aligned_phonemes  : {r['aligned_phonemes']}")
+    def predict(self, grapheme_text: str, lang: str, max_len: int = 80):
+        lang_id = self.lang2id.get(lang, 0)
+        units = self.tokenizer.tokenize(grapheme_text)
+        if not units:
+            return {t: "" for t in ["phonemes", "separated_graphmes", "separated_phonemes", "aligned_phonemes"]}
+        src_ids = self.src_vocab.encode(units)
+        S = len(src_ids)
+        src_t = self.np.array([src_ids], dtype="int64")
+        src_len_t = self.np.array([S], dtype="int64")
+        lang_t = self.np.array([lang_id], dtype="int64")
+        outs = self.session.run(None, {
+            "graphemes": src_t, "src_lens": src_len_t, "langs": lang_t,
+        })
+        ph, sgr, sph, alp = outs
+        result = {}
+        ph_ids = [int(x) for x in ph[0] if x not in (0, 1, 2)]
+        ph_tokens = self.phoneme_vocab.decode(ph_ids)
+        result["phonemes"] = " ".join(ph_tokens)
+        for task, raw in (("separated_graphmes", sgr), ("separated_phonemes", sph),
+                          ("aligned_phonemes", alp)):
+            counts = self.count_codec.decode([int(x) for x in raw[0]])
+            base = units if task == "separated_graphmes" else ph_tokens
+            sep, unit = SEP_UNIT[task]
+            result[task] = reconstruct_groups(base, counts, sep, unit)
+        return result
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--binary_dir", default="data/Korean/binary")
+    ap.add_argument("--model_dir", default="checkpoints/Korean/ckpt",
+                    help="dir holding best_model.pt (training run output)")
+    ap.add_argument("--onnx", default=None, help="use ONNX inferer at this path")
+    ap.add_argument("--lang", default="ko")
+    ap.add_argument("--text", required=True)
+    ap.add_argument("--device", default="cpu")
+    a = ap.parse_args()
+    if a.onnx:
+        inf = ONNXInferer(a.onnx, a.binary_dir)
+    else:
+        inf = load_inferer(a.binary_dir, a.model_dir, a.device)
+    res = inf.predict(a.text, a.lang)
+    for k, v in res.items():
+        print(f"{k}: {v}")

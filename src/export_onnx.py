@@ -1,174 +1,121 @@
-"""Export a single ONNX model with exactly four output nodes.
-
-The exported graph takes
-
-    * ``graphemes`` : int64  [B, S]   source (sub-word / per-char) ids
-    * ``langs``     : int64  [B]      language ids
-    * ``src_lens``  : int64  [B]      valid length per source sequence
-
-and returns four logit tensors (greedy decoding already applied internally,
-but logits are returned so the consumer can re-decide):
-
-    * ``phonemes``          : float32 [B, T, V_ph]
-    * ``separated_graphmes``: float32 [B, T, V_gr]
-    * ``separated_phonemes`` : float32 [B, T, V_ph]
-    * ``aligned_phonemes``   : float32 [B, T, V_ph]
-
-``T`` is fixed to ``--max_len`` at export time (the generate path runs a fixed
-number of auto-regressive steps, which is what makes the graph traceable).
-"""
+"""Export a trained G2PModel to ONNX (single forward, greedy decode loop)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import torch
 
 from src.model import G2PModel
+from src.preprocessing import TARGET_NAMES
+from src.utils import load_model_weights
 
 
-class ONNXWrapper(torch.nn.Module):
+class GreedyWrapper(torch.nn.Module):
+    """Wrap the model so the ONNX graph includes the greedy decode loop.
+
+    Inputs: graphemes [B, S], src_lens [B], langs [B].
+    Outputs: phonemes [B, T], separated_graphmes [B, T], separated_phonemes [B, T],
+             aligned_phonemes [B, T]  (count ids; decode + regroup at call site).
+    """
+
     def __init__(self, model: G2PModel, max_len: int, sos_idx: int):
         super().__init__()
         self.model = model
         self.max_len = max_len
         self.sos_idx = sos_idx
 
-    def forward(self, graphemes: torch.Tensor, src_lens: torch.Tensor, langs: torch.Tensor):
-        # model.generate expects [S, B]; inputs here are [B, S] -> transpose
-        src = graphemes.transpose(0, 1).contiguous()
-        out = self.model.generate(src, src_lens, langs, self.max_len, self.sos_idx)
-        # outputs are [T, B, V] -> transpose to [B, T, V]
-        return (
-            out["phonemes"].transpose(0, 1).contiguous(),
-            out["separated_graphmes"].transpose(0, 1).contiguous(),
-            out["separated_phonemes"].transpose(0, 1).contiguous(),
-            out["aligned_phonemes"].transpose(0, 1).contiguous(),
-        )
-
-
-def _write_metadata(onnx_path: str, meta: dict, max_len: int, eos_idx: int = 2) -> None:
-    """Embed the vocabulary-shape contract into the ONNX file.
-
-    Different languages / phoneme schemes produce ONNX graphs whose only
-    data-dependent dimension is ``V`` (the last dim of every output).  We bake
-    the expected vocabulary sizes into ``metadata_props`` so an inferer can
-    verify that the ONNX and its accompanying vocab files belong together and
-    refuse to silently decode garbage if they do not.
-
-    The four output names are ALWAYS fixed (see ``OUTPUT_NAMES``), which is what
-    lets a single :class:`src.inference.ONNXInferer` drive any language's graph.
-    """
-    import onnx
-
-    m = onnx.load(onnx_path)
-    props = {
-        "g2p.src_vocab_size": str(meta["src_vocab_size"]),
-        "g2p.phoneme_vocab_size": str(meta["phoneme_vocab_size"]),
-        "g2p.grapheme_tgt_vocab_size": str(meta["grapheme_tgt_vocab_size"]),
-        "g2p.num_langs": str(meta["num_langs"]),
-        "g2p.max_len": str(max_len),
-        "g2p.eos_idx": str(eos_idx),
-        "g2p.sos_idx": "1",
-        "g2p.pad_idx": "0",
-        "g2p.outputs": ",".join(OUTPUT_NAMES),
-    }
-    # onnx.metadata_props is a repeated field; clear then set
-    m.metadata_props.clear()
-    for k, v in props.items():
-        p = m.metadata_props.add()
-        p.key, p.value = k, v
-    onnx.save(m, onnx_path)
-
-
-OUTPUT_NAMES = ["phonemes", "separated_graphmes", "separated_phonemes", "aligned_phonemes"]
+    def forward(self, graphemes, src_lens, langs):
+        return self.model.generate(graphemes.transpose(0, 1), src_lens, langs,
+                                   self.max_len, self.sos_idx)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--output", default="g2p_multitask.onnx")
+    ap.add_argument("--binary_dir", default="data/Korean/binary")
+    ap.add_argument("--model_dir", default="checkpoints/Korean/ckpt",
+                    help="dir holding best_model.pt (training run output)")
+    ap.add_argument("--out", default="data/Korean/binary/g2p.onnx")
+    ap.add_argument("--max_len", type=int, default=80)
     ap.add_argument("--opset", type=int, default=17)
-    ap.add_argument("--max_len", type=int, default=80, help="fixed auto-regressive steps baked into the graph")
-    ap.add_argument("--device", default="cpu")
-    args = ap.parse_args()
+    a = ap.parse_args()
 
-    from src.utils import load_model_weights
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
-    if "config" in ckpt and "meta" in ckpt:
-        cfg_d, meta = ckpt["config"], ckpt["meta"]
-    else:
-        # weights-only deployment file: rebuild from meta.json next to it
-        import json, os
-        meta_path = os.path.join(os.path.dirname(os.path.abspath(args.checkpoint)), "meta.json")
-        with open(meta_path, encoding="utf-8") as f:
-            meta = json.load(f)
-        cfg_d = meta  # meta.json now carries the architecture fields too
-
+    with open(os.path.join(a.binary_dir, "meta.json"), "r", encoding="utf-8") as f:
+        meta = json.load(f)
     model = G2PModel(
         src_vocab_size=meta["src_vocab_size"],
         phoneme_vocab_size=meta["phoneme_vocab_size"],
-        grapheme_tgt_vocab_size=meta["grapheme_tgt_vocab_size"],
+        count_vocab_size=meta["count_vocab_size"],
         num_langs=meta["num_langs"],
-        embed_dim=cfg_d["embed_dim"],
-        enc_layers=cfg_d["enc_layers"],
-        dec_layers=cfg_d["dec_layers"],
-        enc_heads=cfg_d["enc_heads"],
-        dec_hidden=cfg_d["dec_hidden"],
-        ffn_dim=cfg_d["ffn_dim"],
+        embed_dim=meta["embed_dim"],
+        enc_layers=meta["enc_layers"],
+        dec_layers=meta["dec_layers"],
+        enc_heads=meta["enc_heads"],
+        dec_hidden=meta["dec_hidden"],
+        ffn_dim=meta["ffn_dim"],
         dropout=0.0,
-        lang_embed_dim=cfg_d["lang_embed_dim"],
+        lang_embed_dim=meta["lang_embed_dim"],
     )
-    load_model_weights(args.checkpoint, model, "cpu")
+    best = os.path.join(a.model_dir, "best_model.pt")
+    if not os.path.exists(best):
+        best = os.path.join(a.model_dir, "model_best.pt")
+    if not os.path.exists(best):
+        best = os.path.join(a.binary_dir, "best_model.pt")
+    load_model_weights(best, model, "cpu")
     model.eval()
 
-    # SOS index is shared across vocabularies (always 1)
-    sos_idx = 1
-    wrapper = ONNXWrapper(model, args.max_len, sos_idx).to(args.device)
+    wrapper = GreedyWrapper(model, a.max_len, 1)
     wrapper.eval()
 
-    # dummy inputs: batch=1, src_len=10 (single-sample dummy avoids the ONNX
-    # LSTM variable-length/batch!=1 caveat; batch dim stays dynamic via axes)
-    B, S = 1, 10
-    dummy_src = torch.zeros(B, S, dtype=torch.long, device=args.device)
-    dummy_lens = torch.full((B,), S, dtype=torch.long, device=args.device)
-    dummy_lang = torch.zeros(B, dtype=torch.long, device=args.device)
+    B = 1
+    S = 8
+    dummy_g = torch.zeros(B, S, dtype=torch.long)
+    dummy_len = torch.ones(B, dtype=torch.long)
+    dummy_lang = torch.zeros(B, dtype=torch.long)
 
-    dynamic_axes = {
-        "graphemes": {0: "B", 1: "S"},
-        "src_lens": {0: "B"},
-        "langs": {0: "B"},
-        "phonemes": {0: "B"},
-        "separated_graphmes": {0: "B"},
-        "separated_phonemes": {0: "B"},
-        "aligned_phonemes": {0: "B"},
+    # The greedy decode loop uses python-level control flow + a dynamic batch
+    # size, which some torch versions cannot capture via torch.export
+    # (``torch.zeros`` with a symbolic batch raises). The PyTorch inference path
+    # (src.inference.load_inferer) always works; ONNX is a best-effort that
+    # succeeds on recent torch builds that support dynamic_shapes export.
+    dynamic_shapes = {
+        "graphemes": {0: torch.export.Dim("B"), 1: torch.export.Dim("S")},
+        "src_lens": {0: torch.export.Dim("B")},
+        "langs": {0: torch.export.Dim("B")},
     }
-
-    torch.onnx.export(
-        wrapper,
-        (dummy_src, dummy_lens, dummy_lang),
-        args.output,
-        input_names=["graphemes", "src_lens", "langs"],
-        output_names=OUTPUT_NAMES,
-        dynamic_axes=dynamic_axes,
-        opset_version=args.opset,
-        do_constant_folding=True,
-        dynamo=False,
-    )
-
-    # Embed the vocab-shape contract so any inferer (any language) can verify
-    # it paired this graph with the matching vocab files.
-    _write_metadata(args.output, meta, args.max_len)
-
-    print(f"[done] exported -> {args.output}")
-    print("       inputs : graphemes[int64 B,S], src_lens[int64 B], langs[int64 B]")
-    print(f"       outputs: {', '.join(OUTPUT_NAMES)} [float32 B,{args.max_len},V]")
-    print(f"       V_ph={meta['phoneme_vocab_size']} V_gr={meta['grapheme_tgt_vocab_size']} "
-          f"V_src={meta['src_vocab_size']} langs={meta['num_langs']}")
+    try:
+        torch.onnx.export(
+            wrapper,
+            (dummy_g, dummy_len, dummy_lang),
+            a.out,
+            input_names=["graphemes", "src_lens", "langs"],
+            output_names=["phonemes", "separated_graphmes", "separated_phonemes", "aligned_phonemes"],
+            dynamic_axes={
+                "graphemes": {0: "B", 1: "S"},
+                "src_lens": {0: "B"},
+                "langs": {0: "B"},
+                "phonemes": {0: "B", 1: "T"},
+                "separated_graphmes": {0: "B", 1: "T"},
+                "separated_phonemes": {0: "B", 1: "T"},
+                "aligned_phonemes": {0: "B", 1: "T"},
+            },
+            opset_version=a.opset,
+            do_constant_folding=True,
+            dynamo=True,
+            dynamic_shapes=dynamic_shapes,
+        )
+        print(f"[onnx] exported -> {a.out}")
+    except Exception as e:  # pragma: no cover - backend dependent
+        print(f"[onnx] export failed: {type(e).__name__}: {e}")
+        print("[onnx] The greedy-decoding loop is not capturable by this torch "
+              "build. Use the PyTorch inference path instead:")
+        print("        python -m src.inference --binary_dir <dir> --text <graphmes>")
 
 
 if __name__ == "__main__":

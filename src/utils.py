@@ -65,10 +65,19 @@ def load_model_weights(checkpoint: str, model, device: str = "cpu"):
     and the deployment-only file written by ``train._save_model_only``
     (``{"model": sd, "dtype": "fp32"|"fp16"}``).  When the file was exported as
     fp16 the model is cast to half precision so ``load_state_dict`` matches dtypes.
+
+    PyTorch >= 2.6 makes ``torch.load`` default to ``weights_only=True``, which
+    refuses to unpickle arbitrary objects (e.g. a checkpoint saved as a full
+    ``torch.save(model, ...)`` object, or one carrying a custom config).  We try
+    the safe ``weights_only=True`` path first and transparently fall back to
+    ``weights_only=False`` so such files still load.
     """
     import torch
 
-    ckpt = torch.load(checkpoint, map_location=device)
+    try:
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "model" in ckpt:
         sd = ckpt["model"]
         if ckpt.get("dtype") == "fp16":

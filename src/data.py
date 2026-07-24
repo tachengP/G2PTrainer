@@ -34,9 +34,12 @@ from src.preprocessing import (
     TARGET_NAMES,
     CSV_COLUMNS,
     Vocab,
+    CountCodec,
     build_source_vocab,
-    parse_aligned_column,
     parse_no_sep,
+    parse_phoneme_counts,
+    parse_grapheme_counts,
+    parse_counts,
     record_targets,
 )
 from src.utils import make_lang_index, parse_lang_from_filename
@@ -45,19 +48,51 @@ from src.utils import make_lang_index, parse_lang_from_filename
 # --------------------------------------------------------------------------- #
 # File discovery
 # --------------------------------------------------------------------------- #
-def discover_files(data_dir: str, file_glob: str) -> List[Tuple[str, str]]:
-    """Return [(csv_path, lang), ...] for every matching dataset file.
+def discover_files(data_dir: str, lang_define: Optional[List[Dict[str, Any]]] = None,
+                   file_glob: Optional[str] = None) -> List[Tuple[str, str, bool]]:
+    """Return [(csv_path, lang, syllable_is_char), ...] for every dataset file.
 
-    A file named ``dataset-ko.csv`` contributes the language label ``"ko"``.
+    Resolution order:
+
+    * If ``lang_define`` is provided (a list of ``{"id", "syllable_is_char"}``
+      dicts), each entry selects ``dataset-{id}.csv`` directly and carries its
+      ``syllable_is_char`` flag.  This is the preferred, explicit path.
+    * Otherwise fall back to ``file_glob`` (legacy), where ``dataset-ko.csv``
+      contributes the language ``"ko"`` and ``syllable_is_char`` defaults to
+      ``False``.
+
+    Backup / original copies (``.orig``, ``~``, ``.bak``) are always skipped so
+    the raw symbol/separator format cannot contaminate the integer-count corpus.
     """
-    pattern = os.path.join(data_dir, file_glob)
+    out: List[Tuple[str, str, bool]] = []
+    if lang_define:
+        for entry in lang_define:
+            if not isinstance(entry, dict):
+                continue
+            lid = entry.get("id")
+            if not lid:
+                continue
+            sic = bool(entry.get("syllable_is_char", False))
+            p = os.path.join(data_dir, f"dataset-{lid}.csv")
+            if os.path.exists(p):
+                out.append((p, lid, sic))
+            else:
+                print(f"[discover] WARNING: {p} not found, skipped")
+        if out:
+            return out
+    pattern = os.path.join(data_dir, file_glob or "dataset-*.csv")
     paths = sorted(glob.glob(pattern))
-    out: List[Tuple[str, str]] = []
     for p in paths:
+        # Never ingest backup / original copies (e.g. ``dataset-ko.csv.orig``):
+        # they carry the raw symbol/separator format, not the integer-count
+        # format the current parser expects, and would either crash binarize
+        # or silently contaminate the training set with duplicate/bad rows.
+        if os.path.basename(p).endswith(".orig") or p.endswith("~") or p.endswith(".bak"):
+            continue
         lang = parse_lang_from_filename(p)
         if lang is None:
             continue
-        out.append((p, lang))
+        out.append((p, lang, False))
     return out
 
 
@@ -122,10 +157,10 @@ def build_dataset(
 
     Returns
     -------
-    (train_ds, val_ds, src_vocab, phoneme_vocab, grapheme_tgt_vocab,
+    (train_ds, val_ds, src_vocab, phoneme_vocab, count_codec,
      tokenizer, pad_idx_dict, meta)
     """
-    files = discover_files(data_dir, file_glob)
+    files = discover_files(data_dir, None, file_glob)
     if not files:
         raise RuntimeError(f"No dataset files matched {file_glob!r} in {data_dir}")
 
@@ -146,30 +181,35 @@ def build_dataset(
         (r["src"] for r in raw_recs), bpe_merges, min_freq
     )
 
-    # 3. Phoneme vocab (union of the three phoneme tasks) + separators.
+    # 3. Phoneme vocab (base phonemes only; separators live in the count tasks).
     phoneme_syms: Counter = Counter()
     for r in raw_recs:
         phoneme_syms.update(parse_no_sep(r["phonemes"]))
-        phoneme_syms.update(parse_aligned_column(r["separated_phonemes"], PIPE, split_within=True))
-        phoneme_syms.update(parse_aligned_column(r["aligned_phonemes"], SLASH, split_within=True))
     ph_symbols = [s for s, _ in phoneme_syms.most_common() if s]
     if phoneme_set is not None:
         ph_symbols = [s for s in ph_symbols if s in set(phoneme_set)]
-    phoneme_vocab = Vocab(ph_symbols + [PIPE, SLASH])
+    phoneme_vocab = Vocab(ph_symbols)
 
-    # 4. Grapheme-target vocab (the 'separated_graphmes' task) + separator.
-    gr_syms: Counter = Counter()
+    # 4. Count codec: max segment length across the three derived tasks.
+    max_count = 1
     for r in raw_recs:
-        gr_syms.update(parse_aligned_column(r["separated_graphmes"], PIPE, split_within=False))
-    gr_symbols = [s for s, _ in gr_syms.most_common() if s]
-    grapheme_tgt_vocab = Vocab(gr_symbols + [PIPE])
+        for c in parse_counts(r["separated_phonemes"]):
+            if c > max_count:
+                max_count = c
+        for c in parse_counts(r["aligned_phonemes"]):
+            if c > max_count:
+                max_count = c
+        for c in parse_counts(r["separated_graphmes"]):
+            if c > max_count:
+                max_count = c
+    count_codec = CountCodec(max_count)
 
     # 5. Encode samples.
     vocab_for = {
         "phonemes": phoneme_vocab,
-        "separated_graphmes": grapheme_tgt_vocab,
-        "separated_phonemes": phoneme_vocab,
-        "aligned_phonemes": phoneme_vocab,
+        "separated_graphmes": count_codec,
+        "separated_phonemes": count_codec,
+        "aligned_phonemes": count_codec,
     }
     lang2id, _ = make_lang_index(langs)
 
@@ -183,13 +223,21 @@ def build_dataset(
         units = tokenizer.tokenize(r["src"])
         if not units:
             continue
-        targets = record_targets(r)
-        # drop rows whose targets are empty or exceed the length budget
+        targets = record_targets(r, units)
+        # drop rows whose derived-task counts disagree with the base sequences
+        # (pre-existing source glitch), or exceed the length budget
+        ph_tokens = parse_no_sep(r["phonemes"])
+        if sum(targets["separated_phonemes"]) != len(ph_tokens):
+            continue
+        if sum(targets["aligned_phonemes"]) != len(ph_tokens):
+            continue
+        if sum(targets["separated_graphmes"]) != len(units):
+            continue
         if any(len(targets[n]) == 0 for n in TARGET_NAMES):
             continue
         if len(units) > max_src_len:
             continue
-        if any(len(targets[n]) + 1 > max_tgt_len for n in TARGET_NAMES):  # +1 for EOS
+        if any(len(targets[n]) > max_tgt_len for n in TARGET_NAMES):
             continue
         samples.append(
             {
@@ -218,7 +266,7 @@ def build_dataset(
     train = samples[n_val:]
     val_monitor = monitor[:n_val]
 
-    pad_idx_dict = {n: vocab_for[n].pad_idx for n in TARGET_NAMES}
+    pad_idx_dict = {n: 0 for n in TARGET_NAMES}
     meta = {
         "langs": sorted(set(langs)),
         "num_langs": len(lang2id),
@@ -226,7 +274,15 @@ def build_dataset(
         "id2lang": {i: l for l, i in lang2id.items()},
         "src_vocab_size": len(src_vocab),
         "phoneme_vocab_size": len(phoneme_vocab),
-        "grapheme_tgt_vocab_size": len(grapheme_tgt_vocab),
+        "count_vocab_size": count_codec.vocab_size,
+        "max_count": count_codec.max_count,
+        "embed_dim": embed_dim,
+        "enc_layers": enc_layers,
+        "dec_layers": dec_layers,
+        "enc_heads": enc_heads,
+        "dec_hidden": dec_hidden,
+        "ffn_dim": ffn_dim,
+        "lang_embed_dim": lang_embed_dim,
     }
 
     return (
@@ -234,7 +290,7 @@ def build_dataset(
         G2PDataset(val),
         src_vocab,
         phoneme_vocab,
-        grapheme_tgt_vocab,
+        count_codec,
         tokenizer,
         pad_idx_dict,
         meta,

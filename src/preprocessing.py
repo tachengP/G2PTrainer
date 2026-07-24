@@ -193,26 +193,20 @@ class ScriptTokenizer:
         self.bpe = bpe or BPETokenizer()
 
     def tokenize(self, text: str) -> List[str]:
-        """Return a sequence of source units.
+        """Return a sequence of source units, one per character.
 
-        * Latin-family spans are BPE-sub-word tokenised.
-        * CJK characters are emitted one per unit.
-        * Other characters (punctuation, digits) are emitted as single units.
+        The source is kept at character granularity on purpose: grapheme
+        segmentation (``separated_graphmes``) is counted per character in
+        convert_csv, so ``len(units)`` must equal the character count for the
+        consistency check in ``bin_data`` to hold.  BPE sub-word merging would
+        collapse non-CJK spans (e.g. romanized Korean ``ne ga`` -> 2 units)
+        while ``separated_graphmes`` still sums to 4 characters, silently
+        dropping every such row.
         """
         units: List[str] = []
         for token in text.split():
-            # split a whitespace token into runs by script
-            buf: List[str] = []
             for ch in token:
-                if is_cjk(ch):
-                    if buf:
-                        units.extend(self.bpe.encode("".join(buf)))
-                        buf = []
-                    units.append(ch)
-                else:
-                    buf.append(ch)
-            if buf:
-                units.extend(self.bpe.encode("".join(buf)))
+                units.append(ch)
         return units
 
     def train_bpe(self, texts: Iterable[str], num_merges: int) -> None:
@@ -339,21 +333,197 @@ def parse_aligned_column(text: str, sep: str, split_within: bool) -> List[str]:
     return syms
 
 
-def record_targets(rec: Dict[str, str]) -> Dict[str, List[str]]:
+def parse_phoneme_counts(text: str, sep: str) -> List[int]:
+    """Number of (whitespace-separated) phoneme units in each ``sep`` segment.
+
+    Within a segment the phonemes are atomic, whitespace-separated tokens, so a
+    segment's count is simply how many tokens it holds.  e.g. ``"n e|g a"`` with
+    ``sep='|'`` -> ``[2, 2]``; ``"n/e g/a"`` with ``sep='/'`` -> ``[1, 2, 1]``.
+    These counts always sum to the number of phoneme tokens in the base
+    ``phonemes`` column, which is exactly what the model must reproduce at infer
+    time when it regroups the predicted phonemes.
+    """
+    return [len(seg.split()) for seg in text.split(sep)]
+
+
+def parse_grapheme_counts(text: str, src_units: Optional[List[str]] = None) -> List[int]:
+    """Number of grapheme units per ``'|'`` segment of ``text``.
+
+    ``|`` is just a visual stand-in for the space that normally separates grapheme
+    groups, so each segment is a contiguous run of graphemes.  Two modes:
+
+    * ``src_units`` given (the BPE-tokenised *source*) -> count source tokens per
+      segment, so the counts sum *exactly* to ``len(src_units)`` and reconstruction
+      can regroup the encoder's real input units.  This is the production path.
+    * ``src_units`` is ``None`` -> fall back to raw characters (correct for CJK
+      where one char == one grapheme and BPE keeps them as singletons).  Used by
+      the offline CSV conversion helper that has no tokenizer.
+    """
+    segs = text.split(PIPE)
+    if src_units is None:
+        return [len(seg.replace(" ", "")) for seg in segs]
+    # Align each source token to the segment of its starting character.  The source
+    # is exactly ``text`` with every '|' removed, so char i of the source maps to
+    # seg_of_char[i]; walking the tokens consumes those chars in order.
+    seg_of_char: List[int] = []
+    cur = 0
+    for ch in text:
+        if ch == PIPE:
+            cur += 1
+        else:
+            seg_of_char.append(cur)
+    counts = [0] * (cur + 1)
+    cursor = 0
+    for tok in src_units:
+        s = seg_of_char[cursor] if cursor < len(seg_of_char) else cur
+        counts[s] += 1
+        cursor += len(tok)
+    return counts
+
+
+class CountCodec:
+    """Compact codec for the three *derived* tasks (separated_*/aligned_*).
+
+    Instead of emitting the full separator-inserted string the model predicts a
+    flat sequence of *segment-length* integers -- e.g. the grapheme grouping
+    ``ㄴㅐ|ㄱ㏘`` becomes ``[2, 2]``.  At inference we regroup the base sequence
+    (graphmes / phonemes) by those counts, which removes the old KL consistency
+    supervision entirely and shrinks the output vocabulary from the full
+    phoneme/grapheme set down to ``max_count + 4``.
+
+    Token ids reuse the phoneme vocab's PAD/SOS/EOS convention so the shared
+    ``generate`` loop needs no special-casing::
+
+        id 0 = PAD, 1 = SOS, 2 = EOS, and a count value ``c`` -> id ``c + 3``.
+
+    ``c`` may be ``0`` (a leading/trailing empty alignment block, e.g. the silent
+    initial ``ㅇ`` of ``아`` -> ``/a`` -> ``[0, 1]``), which maps to id ``3``.
+    """
+
+    def __init__(self, max_count: int):
+        self.max_count = int(max_count)
+        self.pad_idx = 0
+        self.sos_idx = 1
+        self.eos_idx = 2
+        self.vocab_size = self.max_count + 4  # 0..2 reserved, 3..max+3 = counts 0..max
+
+    def encode(self, counts: List[int]) -> List[int]:
+        ids = [self.sos_idx]
+        for c in counts:
+            c = int(c)
+            if c < 0:
+                c = 0
+            if c > self.max_count:
+                c = self.max_count
+            ids.append(c + 3)
+        ids.append(self.eos_idx)
+        return ids
+
+    def decode(self, ids: List[int]) -> List[int]:
+        return [i - 3 for i in ids if i >= 3]
+
+
+def reconstruct_groups(base: List[str], counts: List[int], seg_sep: str,
+                       unit_sep: str) -> str:
+    """Regroup ``base`` units into ``seg_sep``-joined segments per ``counts``.
+
+    ``base`` is the base sequence: source units for ``separated_graphmes``,
+    phoneme tokens for ``separated_/aligned_phonemes``.  ``unit_sep`` joins units
+    *within* a segment (``""`` for graphemes, ``" "`` for phonemes); ``seg_sep``
+    joins segments (``"|"`` for the separated tasks, ``"/"`` for aligned).
+    """
+    if not base:
+        return ""
+    if not counts:
+        # no segment boundaries predicted -> the whole base is one group
+        return unit_sep.join(base)
+    groups: List[str] = []
+    i = 0
+    for c in counts:
+        c = int(c)
+        if c < 0:
+            c = 0
+        if i >= len(base) and c == 0:
+            # trailing empty block beyond the base -> pure separator
+            groups.append("")
+            continue
+        if i >= len(base):
+            break
+        groups.append(unit_sep.join(base[i:i + c]))
+        i += c
+    if i < len(base):
+        groups.append(unit_sep.join(base[i:]))
+    return seg_sep.join(groups)
+
+
+def resegment_by_vowels(base_units: List[str], vowel_set: set, seg_sep: str,
+                        unit_sep: str) -> str:
+    """Regroup a flat phoneme-token sequence into syllables, each containing
+    exactly one vowel, ignoring any prior count prediction.
+
+    For CJK-like languages (``syllable_is_char``) the structural rule is
+    syllable = ``C* V C*`` with at most one vowel nucleus.  We cut a new group at
+    each vowel boundary, placing the cut *after the first consonant* of every
+    consonant run that lies between two vowels (Korean codas are <= 1 consonant,
+    so the first consonant of the run is the coda of the previous syllable and
+    the remainder are onsets of the next).  Leading onset consonants attach to
+    the first syllable; trailing coda consonants attach to the last.  The result
+    always has exactly one group per vowel (== per syllable), which is what the
+    count heads fail to learn on their own.
+
+    Note: a single consonant between two vowels (K==1) is genuinely ambiguous
+    (coda of the previous syllable vs onset of the next) from phonemes alone; the
+    rule treats it as the previous syllable's coda, which is right for the common
+    CVC case.  Perfect resolution needs the grapheme side (Hangul coda info).
+    """
+    if not base_units:
+        return ""
+    n = len(base_units)
+    vposs = [i for i, t in enumerate(base_units) if t in vowel_set]
+    if not vposs:
+        return unit_sep.join(base_units)
+    cuts = [0]
+    for j in range(1, len(vposs)):
+        run_start = vposs[j - 1] + 1
+        run_end = vposs[j]            # exclusive
+        if run_end > run_start:       # there is a consonant run between the vowels
+            cuts.append(run_start + 1)  # coda <= 1: cut after the first consonant
+        else:
+            cuts.append(vposs[j])       # vowels adjacent: cut at the second vowel
+    groups = []
+    for k in range(len(cuts)):
+        start = cuts[k]
+        end = cuts[k + 1] if k + 1 < len(cuts) else n
+        groups.append(base_units[start:end])
+    return seg_sep.join(unit_sep.join(g) for g in groups)
+
+
+def parse_counts(text: str) -> List[int]:
+    """Parse an already-flat count column (space-separated integers) into a list.
+
+    After ``src/convert_csv.py`` has run, the three derived CSV columns
+    (``separated_graphmes`` / ``separated_phonemes`` / ``aligned_phonemes``) store
+    the segment-length sequences directly, so they are read as-is instead of being
+    re-split on separators.
+    """
+    return [int(x) for x in text.split() if x.strip() != ""]
+
+
+def record_targets(rec: Dict[str, str], src_units=None) -> Dict[str, list]:
     """Convert a raw CSV record (dict with canonical keys) into the four targets.
 
-    Every target is framed with ``<sos>`` / ``<eos>`` so that teacher-forcing
-    training and greedy inference share the *exact* same start/stop symbols.
-    Without these, the decoder is never fed ``<sos>`` during training (its
-    embedding row stays randomly initialised) while ``generate`` starts from
-    ``<sos>`` -- the train/infer mismatch makes greedy decoding collapse into
-    repetitive loops that run to ``max_len``.
+    ``phonemes`` stays a symbol sequence framed with ``<sos>``/``<eos>`` (embedded
+    via the phoneme table).  The three derived tasks are stored as flat *count*
+    sequences (segment lengths, space-separated integers) -- exactly the
+    representation the model predicts -- and are read directly with
+    :func:`parse_counts`.  ``src_units`` is kept for call-site compatibility but is
+    no longer needed once the CSV has been converted by ``src/convert_csv.py``.
     """
     return {
         "phonemes": [SOS] + parse_no_sep(rec["phonemes"]) + [EOS],
-        "separated_graphmes": [SOS] + parse_aligned_column(rec["separated_graphmes"], PIPE, split_within=False) + [EOS],
-        "separated_phonemes": [SOS] + parse_aligned_column(rec["separated_phonemes"], PIPE, split_within=True) + [EOS],
-        "aligned_phonemes": [SOS] + parse_aligned_column(rec["aligned_phonemes"], SLASH, split_within=True) + [EOS],
+        "separated_graphmes": parse_counts(rec["separated_graphmes"]),
+        "separated_phonemes": parse_counts(rec["separated_phonemes"]),
+        "aligned_phonemes": parse_counts(rec["aligned_phonemes"]),
     }
 
 

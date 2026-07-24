@@ -4,7 +4,19 @@
 data_dir: data/Korean
 output_dir: checkpoints
 model_name: Korean             # run artifacts saved under checkpoints/{model_name}
-file_glob: "dataset-ko.csv"     # language is parsed as the token after the last '-'
+# Language definitions: each entry selects dataset-{id}.csv and flags whether the
+# language is CJK-like (one character == one independent syllable).  For such
+# languages the phoneme groups are constrained to contain exactly one vowel
+# nucleus, which fixes the separators the count heads under-fit.
+# (Supersedes the legacy `file_glob`.)
+lang_define:
+  - id: ko
+    syllable_is_char: true
+# vowel_phonemes: null          # optional {lang: [phoneme, ...]} explicit override;
+                                  # when null, vowels are derived from data by confidence
+# syllable_constraint_weight: 0.5  # > 0 enables the one-vowel-per-syllable violation
+                                   # diagnostic (logged to TensorBoard); the actual
+                                   # separator fix is applied at inference regardless.
 phoneme_set: null              # optional path to a file with one phoneme per line
 max_src_len: 120
 max_tgt_len: 120
@@ -39,7 +51,7 @@ lang_embed_dim: 8              # language embedding dimension; 0 disables lang e
 max_langs: 64
 
 # --- training ---
-epochs: 30
+epochs: 80
 batch_size: 2048
 lr: 1.0e-2
 weight_decay: 1.0e-5
@@ -49,15 +61,17 @@ fp16: true
 # Group similar-length samples in each batch. Essential so that larger batch
 # sizes do NOT get slower (padding stays ~constant instead of exploding with
 # batch size). Keep true unless you have a reason to randomise batch membership.
-sort_by_length: true                    # mixed precision (AMP) on CUDA
-device: auto                   # auto | cuda | cpu
+sort_by_length: true                    # group similar-length samples in a batch (stable padding)
+device: cuda                   # cuda | cpu
 num_workers: 12
 log_every: 100
-save_every: 1000
+save_every: 10                 # periodic epoch ckpt every N epochs (0 => best+last only)
 
-# --- consistency losses (associate grapheme / phoneme content across tasks) ---
-consistency_weight: 0.5            # phoneme consistency (cross-decoder) weight
-grapheme_consistency_weight: 0.5   # grapheme consistency (source reconstruction) weight
+# --- derived-task design note ---
+# separated_graphmes / separated_phonemes / aligned_phonemes are encoded as flat
+# *count* sequences (segment lengths) and regrouped from the base graphmes /
+# phonemes at inference. No cross-task consistency supervision is used -- the
+# encoder is shared and each decoder head is independent.
 
 # --- tensorboard monitoring ---
 tensorboard: true                  # enable TensorBoard logging

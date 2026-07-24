@@ -6,7 +6,7 @@ import argparse
 import copy
 import typing
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -17,7 +17,19 @@ class Config:
     data_dir: str = "data"
     output_dir: str = "checkpoints"
     model_name: str = "default"        # sub-directory under output_dir for this run's artifacts
-    file_glob: str = "dataset-*.csv"
+    # Language definitions: each entry is {id, syllable_is_char}.  `id` selects the
+    # dataset file `dataset-{id}.csv`; `syllable_is_char` flags CJK-like languages
+    # where one character == one independent syllable (so each phoneme group must
+    # contain exactly one vowel nucleus).  Supersedes the legacy `file_glob`.
+    lang_define: Optional[List[Dict[str, Any]]] = None
+    file_glob: str = "dataset-*.csv"   # legacy fallback when lang_define is empty
+    # Optional explicit vowel-phoneme sets per language (list of phoneme symbols).
+    # When omitted, vowels are derived from the training data by confidence.
+    vowel_phonemes: Optional[Dict[str, List[str]]] = None
+    # Diagnostic switch (NOT added to the loss): when > 0, the training loop logs
+    # the fraction of predicted count-groups that violate the one-vowel-per-syllable
+    # rule -- a direct read on whether the separator learning is improving.
+    syllable_constraint_weight: float = 0.5
     phoneme_set: Optional[str] = None
     max_src_len: int = 120
     max_tgt_len: int = 120
@@ -48,11 +60,11 @@ class Config:
 
     # training
     epochs: int = 30
-    batch_size: int = 64
+    batch_size: int = 512
     lr: float = 1.0e-3
     weight_decay: float = 1.0e-5
     grad_clip: float = 5.0
-    lr_decay_gamma: float = 1.0       # per-epoch lr multiplier; 1.0 = no decay, 0.8 = decay to 80% each epoch
+    lr_decay_gamma: float = 0.8       # per-epoch lr multiplier; 1.0 = no decay, 0.8 = decay to 80% each epoch
     fp16: bool = False
     sort_by_length: bool = True       # group similar-length samples per batch so padding (and thus BiLSTM + attention cost) stops exploding with batch size
     device: str = "auto"
@@ -60,9 +72,8 @@ class Config:
     log_every: int = 50
     save_every: int = 500
 
-    # consistency losses (associate grapheme / phoneme content across tasks)
-    consistency_weight: float = 0.5          # phoneme consistency (cross-decoder)
-    grapheme_consistency_weight: float = 0.5  # grapheme consistency (source reconstruction)
+    # derived tasks are encoded as *count* sequences and regrouped at inference,
+    # so no cross-task consistency supervision is needed.
 
     # tensorboard monitoring
     tensorboard: bool = True
@@ -79,6 +90,8 @@ class Config:
 
     # data residency
     data_on_gpu: bool = False        # keep the dataset resident on CUDA (num_workers=0), freeing host RAM
+
+    force_rebinarize: bool = False   # ignore existing binary dir and rebuild from CSV
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -125,7 +138,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     # allow overriding any top-level field via CLI
     for key, val in _dataclass_defaults().items():
         if isinstance(val, bool):
-            p.add_argument(f"--{key}", type=_str2bool, default=None)
+            # nargs="?" + const=True so `--flag` alone sets True; `--flag false`
+            # sets False; omitted leaves None (config default is respected).
+            p.add_argument(f"--{key}", type=_str2bool, nargs="?", const=True, default=None)
         else:
             p.add_argument(f"--{key}", type=_cli_type(key, val), default=None)
     return p.parse_args(argv)
