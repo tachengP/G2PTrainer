@@ -152,27 +152,48 @@ class Inferer:
         vset = (set(self.vowel_symbols[lang])
                 if (isc and lang in self.vowel_symbols and self.vowel_symbols[lang])
                 else None)
+        # Anchor the group count on the *predicted* syllable grouping
+        # (separated_graphmes), not the raw character count.  For CJK the two
+        # coincide; for romanized text they differ, and len(units) was the cause
+        # of the "extra separators" over-segmentation bug.
+        sg_counts = (self.count_codec.decode(
+            [int(i) for i in out["separated_graphmes"][0].tolist()])
+            if "separated_graphmes" in out else [])
+        n_syll = (max(1, sum(1 for c in sg_counts if c > 0))
+                  if sg_counts else n_chars)
         for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
             if task not in tasks:
                 continue
             sep, unit = SEP_UNIT[task]
             # For one-char-one-syllable languages, enforce the structural
             # constraints at reconstruction time (the count head is not trusted):
-            #   * separated_graphmes -> one group per source grapheme ([1]*N)
+            #   * separated_graphmes -> regroup the source units by the predicted
+            #     syllable sizes (one group per syllable)
             #   * separated_phonemes -> exactly N groups (== separated_graphmes)
-            #   * aligned_phonemes   -> vowel-led grouping, length N+1 (deliberately
-            #     different from separated_phonemes -- the two must NOT match)
+            #   * aligned_phonemes   -> vowel-led grouping, length N or N+1
             if isc and vset is not None:
                 if task == "separated_graphmes":
-                    result[task] = sep.join(units)
+                    # regroup the source units by the predicted syllable sizes
+                    if sg_counts:
+                        grp, i = [], 0
+                        for c in sg_counts:
+                            if c <= 0:
+                                continue
+                            grp.append(unit.join(units[i:i + c]))
+                            i += c
+                        if i < len(units):
+                            grp.append(unit.join(units[i:]))
+                        result[task] = sep.join(grp)
+                    else:
+                        result[task] = sep.join(units)
                 elif task == "separated_phonemes":
                     counts = self.count_codec.decode(
                         [int(i) for i in out[task][0].tolist()])
                     result[task] = reconstruct_separated_anchored(
-                        ph_tokens, counts, n_chars, sep, unit)
+                        ph_tokens, counts, n_syll, sep, unit)
                 else:  # aligned_phonemes
                     result[task] = reconstruct_aligned_vowel_led(
-                        ph_tokens, vset, sep, unit, expected_n=n_chars)
+                        ph_tokens, vset, sep, unit, expected_n=n_syll)
             else:
                 counts = self.count_codec.decode([int(i) for i in out[task][0].tolist()])
                 base = units if task == "separated_graphmes" else ph_tokens
@@ -228,19 +249,38 @@ class ONNXInferer:
         vset = (set(self.vowel_symbols[lang])
                 if (isc and lang in self.vowel_symbols and self.vowel_symbols[lang])
                 else None)
+        # Anchor the group count on the *predicted* syllable grouping
+        # (separated_graphmes), not the raw character count.  For CJK the two
+        # coincide; for romanized text they differ, and len(units) was the cause
+        # of the "extra separators" over-segmentation bug.
+        sg_counts = self.count_codec.decode([int(x) for x in sgr[0]]) if sgr is not None else []
+        n_syll = (max(1, sum(1 for c in sg_counts if c > 0))
+                  if sg_counts else n_chars)
         for task, raw in (("separated_graphmes", sgr), ("separated_phonemes", sph),
                           ("aligned_phonemes", alp)):
             sep, unit = SEP_UNIT[task]
             if isc and vset is not None:
                 if task == "separated_graphmes":
-                    result[task] = sep.join(units)
+                    # regroup the source units by the predicted syllable sizes
+                    if sg_counts:
+                        grp, i = [], 0
+                        for c in sg_counts:
+                            if c <= 0:
+                                continue
+                            grp.append(unit.join(units[i:i + c]))
+                            i += c
+                        if i < len(units):
+                            grp.append(unit.join(units[i:]))
+                        result[task] = sep.join(grp)
+                    else:
+                        result[task] = sep.join(units)
                 elif task == "separated_phonemes":
                     counts = self.count_codec.decode([int(x) for x in raw[0]])
                     result[task] = reconstruct_separated_anchored(
-                        ph_tokens, counts, n_chars, sep, unit)
+                        ph_tokens, counts, n_syll, sep, unit)
                 else:  # aligned_phonemes
                     result[task] = reconstruct_aligned_vowel_led(
-                        ph_tokens, vset, sep, unit, expected_n=n_chars)
+                        ph_tokens, vset, sep, unit, expected_n=n_syll)
             else:
                 counts = self.count_codec.decode([int(x) for x in raw[0]])
                 base = units if task == "separated_graphmes" else ph_tokens

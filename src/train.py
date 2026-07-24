@@ -60,37 +60,56 @@ def build_model(cfg, meta, count_vocab_size):
 
 
 def reconstruct_prediction(src_units, phoneme_tokens, counts, task, vowel_set=None,
-                            n_chars=None, syllable_is_char=False):
+                            n_chars=None, syllable_is_char=False,
+                            sep_graph_counts=None):
     """Turn predicted counts back into the separator-joined string for monitoring.
 
     For one-char-one-syllable languages (``syllable_is_char``) the structural
     constraints are enforced at reconstruction time, exactly like inference:
 
-      * ``separated_graphmes``  -> one group per source grapheme (``[1]*N``),
-        so its length is always ``N = len(src_units)``.
+      * ``separated_graphmes``  -> the source units grouped the way the *model*
+        predicted (one group per syllable).  For CJK this collapses to one group
+        per character (``[1]*N``); for romanized text the predicted group sizes
+        chunk the character stream into syllables (e.g. "hwak shil hi" ->
+        "hwak|shil|hi").
       * ``separated_phonemes``  -> exactly ``N`` groups over the phoneme base
-        (``reconstruct_separated_anchored``), so
+        (``reconstruct_separated_anchored``), where ``N`` is the *syllable* count
+        taken from the predicted ``separated_graphmes`` grouping, so
         ``len(separated_phonemes) == len(separated_graphmes)`` always holds.
-      * ``aligned_phonemes``    -> the unambiguous vowel-led grouping
-        (``reconstruct_aligned_vowel_led``), whose length is ``N+1`` -- deliberately
-        *not* equal to ``separated_phonemes``.
+      * ``aligned_phonemes``    -> ``N`` or ``N+1`` groups (vowel-led,
+        ``reconstruct_aligned_vowel_led``).  This is the relationship verified on
+        the gold data: the aligned length equals the separated length, or is one
+        longer when the word does not start with a vowel.
 
-    For other languages the count head is trusted via ``reconstruct_groups`` (or
-    ``resegment_by_vowels`` when a vowel set is supplied).
+    The anchor ``N`` is the syllable count (from the predicted separated_graphmes
+    grouping), NOT ``len(src_units)``.  For CJK the two coincide; for romanized
+    they differ, and using the raw character count was the cause of the
+    "extra separators" over-segmentation bug.
     """
     sep, unit = SEP_UNIT[task]
+    # Anchor group count = the *syllable* count, derived from the predicted
+    # separated_graphmes grouping rather than the raw character count.
+    n_syll = n_chars if n_chars is not None else len(src_units)
     if syllable_is_char and vowel_set is not None:
         if task == "separated_graphmes":
-            # one grapheme per group, deterministically from the source text
+            # regroup the source units by the model's predicted syllable sizes
+            if sep_graph_counts:
+                grp, i = [], 0
+                for c in sep_graph_counts:
+                    if c <= 0:
+                        continue
+                    grp.append(unit.join(src_units[i:i + c]))
+                    i += c
+                if i < len(src_units):  # trailing leftover safety net
+                    grp.append(unit.join(src_units[i:]))
+                return sep.join(grp)
             return sep.join(src_units)
         if task == "separated_phonemes":
-            n = n_chars if n_chars is not None else len(src_units)
             return reconstruct_separated_anchored(
-                phoneme_tokens, counts, n, sep, unit)
+                phoneme_tokens, counts, n_syll, sep, unit)
         if task == "aligned_phonemes":
-            n = n_chars if n_chars is not None else len(src_units)
             return reconstruct_aligned_vowel_led(
-                phoneme_tokens, vowel_set, sep, unit, expected_n=n)
+                phoneme_tokens, vowel_set, sep, unit, expected_n=n_syll)
     if task == "separated_graphmes":
         base = src_units
     else:
@@ -321,19 +340,28 @@ def main():
                     ph_tokens = phoneme_vocab.decode(ph_ids)
                     ph_str = " ".join(ph_tokens)
                     line = f"    {m['text']} -> phonemes: {ph_str}"
+                    mchars = tokenizer.tokenize(m["text"])
+                    misc = syllable_is_char.get(m["lang"], False)
+                    # Anchor the group count on the *predicted* syllable grouping
+                    # (separated_graphmes), not the raw character count.  For CJK
+                    # the two coincide; for romanized text they differ -- and using
+                    # len(mchars) was the cause of the "extra separators" bug.
+                    sg_counts = counts_from_ids(
+                        out["separated_graphmes"][i].tolist(), count_codec)
+                    n_syll = (max(1, sum(1 for c in sg_counts if c > 0))
+                              if sg_counts else len(mchars))
                     for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
                         counts = counts_from_ids(out[task][i].tolist(), count_codec)
                         vset = None
-                        mchars = tokenizer.tokenize(m["text"])
-                        misc = syllable_is_char.get(m["lang"], False)
                         if task in ("separated_phonemes", "aligned_phonemes"):
                             mlang = m["lang"]
                             if misc and mlang in vowel_symbols:
                                 vset = set(vowel_symbols[mlang])
                         recon = reconstruct_prediction(
                             mchars, ph_tokens, counts, task,
-                            vowel_set=vset, n_chars=len(mchars),
-                            syllable_is_char=misc)
+                            vowel_set=vset, n_chars=n_syll, syllable_is_char=misc,
+                            sep_graph_counts=(sg_counts
+                                              if task == "separated_graphmes" else None))
                         line += f" | {task}: {recon}"
                     print(line)
 
