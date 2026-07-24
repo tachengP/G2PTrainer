@@ -23,7 +23,8 @@ from src.preprocessing import (
     SLASH,
     load_bpe,
     reconstruct_groups,
-    resegment_by_vowels,
+    reconstruct_aligned_vowel_led,
+    reconstruct_separated_anchored,
 )
 from src.utils import load_model_weights
 
@@ -146,19 +147,32 @@ class Inferer:
         ph_ids = [x for x in ph_ids if x not in (0, 1, 2)]
         ph_tokens = self.phoneme_vocab.decode(ph_ids)
         result["phonemes"] = " ".join(ph_tokens)
+        n_chars = len(units)
+        isc = self.syllable_is_char.get(lang, False)
+        vset = (set(self.vowel_symbols[lang])
+                if (isc and lang in self.vowel_symbols and self.vowel_symbols[lang])
+                else None)
         for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
             if task not in tasks:
                 continue
             sep, unit = SEP_UNIT[task]
-            # For one-char-one-syllable languages, re-segment the (correct) phoneme
-            # sequence by vowel nucleus instead of trusting the count head -- this
-            # guarantees each `|`/`/` group has exactly one vowel, fixing the
-            # separator errors the count heads under-fit.
-            if (task in ("separated_phonemes", "aligned_phonemes")
-                    and self.syllable_is_char.get(lang)
-                    and lang in self.vowel_symbols and self.vowel_symbols[lang]):
-                result[task] = resegment_by_vowels(
-                    ph_tokens, set(self.vowel_symbols[lang]), sep, unit)
+            # For one-char-one-syllable languages, enforce the structural
+            # constraints at reconstruction time (the count head is not trusted):
+            #   * separated_graphmes -> one group per source grapheme ([1]*N)
+            #   * separated_phonemes -> exactly N groups (== separated_graphmes)
+            #   * aligned_phonemes   -> vowel-led grouping, length N+1 (deliberately
+            #     different from separated_phonemes -- the two must NOT match)
+            if isc and vset is not None:
+                if task == "separated_graphmes":
+                    result[task] = sep.join(units)
+                elif task == "separated_phonemes":
+                    counts = self.count_codec.decode(
+                        [int(i) for i in out[task][0].tolist()])
+                    result[task] = reconstruct_separated_anchored(
+                        ph_tokens, counts, n_chars, sep, unit)
+                else:  # aligned_phonemes
+                    result[task] = reconstruct_aligned_vowel_led(
+                        ph_tokens, vset, sep, unit, expected_n=n_chars)
             else:
                 counts = self.count_codec.decode([int(i) for i in out[task][0].tolist()])
                 base = units if task == "separated_graphmes" else ph_tokens
@@ -179,6 +193,8 @@ class ONNXInferer:
             meta = json.load(f)
         self.meta = meta
         self.lang2id = meta["lang2id"]
+        self.vowel_symbols = meta.get("vowel_phonemes") or {}
+        self.syllable_is_char = meta.get("syllable_is_char") or {}
         from src.bin_data import load_src_vocab, load_phoneme_vocab, load_count_codec
         self.src_vocab = load_src_vocab(os.path.join(binary_dir, "src_vocab.txt"))
         self.phoneme_vocab = load_phoneme_vocab(os.path.join(binary_dir, "phoneme_vocab.txt"))
@@ -207,12 +223,28 @@ class ONNXInferer:
         ph_ids = [int(x) for x in ph[0] if x not in (0, 1, 2)]
         ph_tokens = self.phoneme_vocab.decode(ph_ids)
         result["phonemes"] = " ".join(ph_tokens)
+        n_chars = len(units)
+        isc = self.syllable_is_char.get(lang, False)
+        vset = (set(self.vowel_symbols[lang])
+                if (isc and lang in self.vowel_symbols and self.vowel_symbols[lang])
+                else None)
         for task, raw in (("separated_graphmes", sgr), ("separated_phonemes", sph),
                           ("aligned_phonemes", alp)):
-            counts = self.count_codec.decode([int(x) for x in raw[0]])
-            base = units if task == "separated_graphmes" else ph_tokens
             sep, unit = SEP_UNIT[task]
-            result[task] = reconstruct_groups(base, counts, sep, unit)
+            if isc and vset is not None:
+                if task == "separated_graphmes":
+                    result[task] = sep.join(units)
+                elif task == "separated_phonemes":
+                    counts = self.count_codec.decode([int(x) for x in raw[0]])
+                    result[task] = reconstruct_separated_anchored(
+                        ph_tokens, counts, n_chars, sep, unit)
+                else:  # aligned_phonemes
+                    result[task] = reconstruct_aligned_vowel_led(
+                        ph_tokens, vset, sep, unit, expected_n=n_chars)
+            else:
+                counts = self.count_codec.decode([int(x) for x in raw[0]])
+                base = units if task == "separated_graphmes" else ph_tokens
+                result[task] = reconstruct_groups(base, counts, sep, unit)
         return result
 
 

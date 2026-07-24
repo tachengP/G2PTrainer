@@ -456,6 +456,137 @@ def reconstruct_groups(base: List[str], counts: List[int], seg_sep: str,
     return seg_sep.join(groups)
 
 
+def _fit_group_count(groups: List[List[str]], target: int) -> List[List[str]]:
+    """Adjust ``groups`` to contain exactly ``target`` groups.
+
+    Used to enforce structural length constraints -- e.g. ``aligned_phonemes``
+    must be one group longer than ``separated_phonemes``.  When there are too
+    many groups (the phoneme stream contained more vowels than syllables) we
+    merge the trailing ones into the last kept group, preserving the leading
+    onset.  When there are too few we split the last group into contiguous
+    sub-groups until the target count is reached.
+    """
+    if not groups:
+        return [[] for _ in range(target)]
+    if len(groups) == target:
+        return groups
+    if len(groups) > target:
+        head = groups[:target - 1]
+        merged = [u for g in groups[target - 1:] for u in g]
+        return head + [merged]
+    # too few groups: split the last group into (deficit + 1) contiguous parts
+    deficit = target - len(groups)
+    last = groups[-1]
+    groups = groups[:-1]
+    k = deficit + 1
+    n = len(last)
+    if n == 0:
+        groups.extend([[] for _ in range(k)])
+        return groups[:target]
+    step = max(1, n // k)
+    parts = [last[i * step:(i + 1) * step] for i in range(k)]
+    if sum(len(p) for p in parts) < n:
+        parts[-1] = parts[-1] + last[step * k:]
+    groups.extend(parts)
+    return groups[:target]
+
+
+def reconstruct_aligned_vowel_led(base_units: List[str], vowel_set: set,
+                                  seg_sep: str, unit_sep: str,
+                                  expected_n: Optional[int] = None) -> str:
+    """Deterministic ``aligned_phonemes`` grouping: ``[leading-onset-run]``
+    followed by ``[vowel + following-onset-run]*`` -- one group per vowel, with
+    the consonant run *between* two vowels attached to the **previous** vowel's
+    group.
+
+    Unlike syllable (C*VC*) grouping, this rule is unambiguous straight from the
+    phoneme stream + vowel set (it never has to decide coda-vs-onset), so it is
+    safe to use at inference instead of trusting the count head.
+
+    For one-char-one-syllable languages the number of groups is ``num_vowels + 1``
+    (or ``num_vowels`` when the word starts with a vowel).  Because each syllable
+    has exactly one vowel, ``num_vowels == len(separated_phonemes) == N`` (the
+    syllable/character count), so the aligned length is ``N + 1`` when the word
+    begins with a consonant and ``N`` when it begins with a vowel -- verified on
+    the Korean gold data (92.8% are ``N+1``, 7.2% are ``N``).
+
+    When ``expected_n`` (= the separated/syllable count ``N``) is supplied, the
+    group count is *forced* to that relationship regardless of how many vowels
+    the (possibly mis-predicted) phoneme stream contains: a leading onset group
+    is added unless the word begins with a vowel, and any over/under-count is
+    reconciled by :func:`_fit_group_count`.  This decouples the alignment length
+    constraint from the phoneme-stream vowel count.
+    """
+    if not base_units:
+        return ""
+    vposs = [i for i, t in enumerate(base_units) if t in vowel_set]
+    if not vposs:
+        return unit_sep.join(base_units)
+    groups: List[List[str]] = []
+    # leading onset run before the first vowel (may be empty)
+    groups.append(base_units[0:vposs[0]])
+    for k, v in enumerate(vposs):
+        nxt = vposs[k + 1] if k + 1 < len(vposs) else len(base_units)
+        groups.append(base_units[v:nxt])
+    groups = [g for g in groups if g]  # drop an empty leading group
+
+    # ---- structural constraint: aligned length == separated length + (1 or 0) ----
+    if expected_n is not None:
+        starts_with_vowel = bool(base_units) and base_units[0] in vowel_set
+        target = int(expected_n) + (0 if starts_with_vowel else 1)
+        groups = _fit_group_count(groups, target)
+
+    return seg_sep.join(unit_sep.join(g) for g in groups)
+
+
+def reconstruct_separated_anchored(base_units: List[str], counts: List[int],
+                                   n_groups: int, seg_sep: str,
+                                   unit_sep: str) -> str:
+    """Force ``separated_phonemes`` to have exactly ``n_groups`` groups, where
+    ``n_groups`` is the number of source graphemes (== length of
+    ``separated_graphmes``).  This is the hard structural constraint
+    ``len(separated_phonemes) == len(separated_graphmes)``.
+
+    Placement uses the model's predicted ``counts`` as *proportional weights* for
+    where to cut the phoneme base, so the relative segmentation the count head
+    learned is preserved while the total group count is pinned to ``n_groups``.
+    The consonant between two vowels is treated as the onset of the next syllable
+    (the ``separated_phonemes`` convention), which is what makes its length equal
+    the syllable/character count.
+    """
+    if not base_units:
+        return ""
+    n_groups = max(1, int(n_groups))
+    P = len(base_units)
+    weights = [c for c in (counts or []) if isinstance(c, int) and c > 0]
+    if not weights:
+        weights = [1] * n_groups
+    elif len(weights) < n_groups:
+        # pad with the mean so every group gets a positive weight
+        mean_w = max(1, sum(weights) // len(weights))
+        weights = weights + [mean_w] * (n_groups - len(weights))
+    else:
+        weights = weights[:n_groups]
+    total = sum(weights) or 1
+    groups: List[List[str]] = []
+    i = 0
+    for k in range(n_groups):
+        if k == n_groups - 1:
+            c = P - i  # last group absorbs the exact remainder
+        else:
+            c = int(round(weights[k] / total * P))
+            # keep >=1 token for this group and for every remaining group
+            c = max(1, min(c, P - i - (n_groups - 1 - k)))
+        c = max(1, min(c, P - i))
+        if c <= 0:
+            break
+        groups.append(base_units[i:i + c])
+        i += c
+    if i < P:  # safety: append any leftover (shouldn't happen)
+        groups.append(base_units[i:])
+    return seg_sep.join(unit_sep.join(g) for g in groups)
+
+
 def resegment_by_vowels(base_units: List[str], vowel_set: set, seg_sep: str,
                         unit_sep: str) -> str:
     """Regroup a flat phoneme-token sequence into syllables, each containing

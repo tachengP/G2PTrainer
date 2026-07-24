@@ -66,6 +66,42 @@ def _syllable_violation(logits, ph_target, ph_pad, vowel_ids, lang, mask):
     return torch.tensor(viol / tot, dtype=logits.dtype, device=logits.device)
 
 
+def _aligned_length_violation(logits_ali, logits_sep, ph_target, ph_pad,
+                              vowel_ids, lang, mask):
+    """Diagnostic (NOT a loss): fraction of samples whose predicted
+    ``aligned_phonemes`` group count != predicted ``separated_phonemes`` group
+    count + (1 unless the word starts with a vowel).
+
+    Both counts come from argmax of the raw count heads, so this carries no
+    gradient -- it only reports whether the shared count head has learned the
+    ``len(aligned) == len(separated) + 1`` structural relationship verified on
+    the Korean gold data.  Vowel-initialness is decided from the first gold
+    phoneme.
+    """
+    pa = logits_ali.argmax(dim=-1)  # [T-1, B]
+    ps = logits_sep.argmax(dim=-1)
+    B = pa.size(1)
+    viol = 0
+    tot = 0
+    vowel_ids = vowel_ids or set()
+    for b in range(B):
+        lid = int(lang[b].item())
+        if lid >= len(mask) or not bool(mask[lid]):
+            continue
+        first = next((int(x) for x in ph_target[b].tolist()
+                      if x not in (0, 1, 2)), None)
+        starts_with_vowel = first is not None and first in vowel_ids
+        n_sep = sum(1 for i in ps[:, b].tolist() if int(i) >= 3)
+        n_ali = sum(1 for i in pa[:, b].tolist() if int(i) >= 3)
+        expected = n_sep + (0 if starts_with_vowel else 1)
+        if n_ali != expected:
+            viol += 1
+        tot += 1
+    if tot == 0:
+        return None
+    return torch.tensor(viol / tot, dtype=logits_ali.dtype, device=logits_ali.device)
+
+
 class Encoder(nn.Module):
     def __init__(self, src_vocab_size: int, embed_dim: int, hidden: int,
                  num_layers: int, dropout: float, lang_embed_dim: int,
@@ -142,6 +178,24 @@ class G2PModel(nn.Module):
         self.count_embed = nn.Embedding(count_vocab_size, dec_hidden, padding_idx=0)
         self.count_head = nn.Linear(dec_hidden, count_vocab_size)
 
+        # Per-task embedding so the *shared* count head can tell the three
+        # derived tasks apart.  Without this the decoder has no task signal at
+        # generation time (it always starts from SOS), so separated_graphmes /
+        # separated_phonemes / aligned_phonemes collapse to near-identical outputs
+        # -- e.g. separated_phonemes ends up copying aligned_phonemes' segmentation
+        # and loses the hard ``len(separated_phonemes) == len(separated_graphmes)``
+        # constraint.  Feeding the task id at every decoder step lets each task
+        # learn its own length/grouping (N for separated_*, N+1 for aligned_*).
+        self.task_ids = {n: i for i, n in enumerate(TARGET_NAMES)}
+        self.task_embed = nn.Embedding(len(TARGET_NAMES), dec_hidden)
+        # Precomputed task-embedding table (buffer) so the per-step lookup is a
+        # plain integer index -- export-friendly (no in-loop tensor creation).
+        self.register_buffer(
+            "task_emb_table",
+            self.task_embed.weight.detach().clone(),
+            persistent=False,
+        )
+
         # decoder input is the embedding of the previously predicted token; its
         # dimensionality equals dec_hidden regardless of which task is active.
         self.dec = Decoder(dec_hidden, dec_hidden, dec_layers, dropout)
@@ -202,7 +256,8 @@ class G2PModel(nn.Module):
             pad_idx = pad_idx_dict[task]
             # teacher forcing: feed tgt[:, :-1], predict tgt[:, 1:]
             prev = tgt[:, :-1].transpose(0, 1).contiguous()   # [T-1, B]
-            y_emb = self._embed_prev(prev, task)
+            te = self.task_emb_table[self.task_ids[task]].unsqueeze(0)  # [1, B, H]
+            y_emb = self._embed_prev(prev, task) + te
             h, state = self.dec(y_emb, dec_state)
             # cross attention: query = decoder hidden, kv = encoder output
             h = self._cross_attn(h, enc_out, (src == 0).transpose(0, 1))
@@ -233,6 +288,17 @@ class G2PModel(nn.Module):
                         vowel_ids, lang, syllable_lang_mask)
                     if viol is not None:
                         loss_parts[task + "_syllable_viol"] = viol
+                # aligned group count must be separated count + 1 (or +0 when the
+                # word starts with a vowel).  Monitored purely on the raw count
+                # heads so it stays a gradient-free signal of the structural rule.
+                la = task_logits.get("aligned_phonemes")
+                ls = task_logits.get("separated_phonemes")
+                if la is not None and ls is not None:
+                    av = _aligned_length_violation(
+                        la, ls, ph_target, pad_idx_dict.get("phonemes", 0),
+                        vowel_ids, lang, syllable_lang_mask)
+                    if av is not None:
+                        loss_parts["aligned_phonemes_length_viol"] = av
         return total, loss_parts
 
     # ----- greedy generation --------------------------------------------- #
@@ -240,6 +306,10 @@ class G2PModel(nn.Module):
                  tasks=None, pad_idx_dict=None, repetition_penalty: float = 1.5):
         if tasks is None:
             tasks = list(TARGET_NAMES)
+        # collate yields batch-first [B, S]; the encoder wants seq-first [S, B].
+        # (forward does the same transpose -- without it the encoder/attention
+        # mask shapes mismatch for any sequence longer than the batch size.)
+        src = src.transpose(0, 1).contiguous()
         eos_idx = 2  # PAD=0, SOS=1, EOS=2 (shared across vocabs)
         enc_out, dec_state = self.enc(src, src_len, lang)
         B = src.size(1)
@@ -249,6 +319,9 @@ class G2PModel(nn.Module):
         seqs = {t: [[] for _ in range(B)] for t in tasks}
         done = {t: [False] * B for t in tasks}
         key_pad = (src == 0).transpose(0, 1)
+        # per-task embedding, constant across the decode steps of a task
+        task_emb = {t: self.task_emb_table[self.task_ids[t]].unsqueeze(0)
+                    for t in tasks}
         for _ in range(max_len):
             still_active = False
             for task in tasks:
@@ -259,7 +332,7 @@ class G2PModel(nn.Module):
                     [s[-1] if (s and not done[task][b]) else sos_idx
                      for b, s in enumerate(seqs[task])],
                     dtype=torch.long, device=src.device)
-                y_emb = self._embed_prev(prev.unsqueeze(0), task)  # [1, B, H]
+                y_emb = self._embed_prev(prev.unsqueeze(0), task) + task_emb[task]  # [1, B, H]
                 h, states[task] = self.dec(y_emb, states[task])
                 h = self._cross_attn(h, enc_out, key_pad)
                 logits = self._head(h[0], task)                   # [B, V]

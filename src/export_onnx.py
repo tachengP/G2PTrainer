@@ -32,7 +32,8 @@ class GreedyWrapper(torch.nn.Module):
         self.sos_idx = sos_idx
 
     def forward(self, graphemes, src_lens, langs):
-        return self.model.generate(graphemes.transpose(0, 1), src_lens, langs,
+        # generate() transposes batch-first [B, S] internally, so pass as-is.
+        return self.model.generate(graphemes, src_lens, langs,
                                    self.max_len, self.sos_idx)
 
 

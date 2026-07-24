@@ -27,6 +27,8 @@ from src.preprocessing import (
     SLASH,
     TARGET_NAMES,
     reconstruct_groups,
+    reconstruct_aligned_vowel_led,
+    reconstruct_separated_anchored,
     resegment_by_vowels,
     record_targets,
     parse_no_sep,
@@ -57,15 +59,38 @@ def build_model(cfg, meta, count_vocab_size):
     return model
 
 
-def reconstruct_prediction(src_units, phoneme_tokens, counts, task, vowel_set=None):
+def reconstruct_prediction(src_units, phoneme_tokens, counts, task, vowel_set=None,
+                            n_chars=None, syllable_is_char=False):
     """Turn predicted counts back into the separator-joined string for monitoring.
 
-    When ``vowel_set`` is given (a CJK-like language with one-char-one-syllable),
-    the phoneme-group tasks are re-segmented by vowel nucleus instead of trusting
-    the count head -- which is exactly what inference does, so the training log
-    shows the same corrected output the user will actually get.
+    For one-char-one-syllable languages (``syllable_is_char``) the structural
+    constraints are enforced at reconstruction time, exactly like inference:
+
+      * ``separated_graphmes``  -> one group per source grapheme (``[1]*N``),
+        so its length is always ``N = len(src_units)``.
+      * ``separated_phonemes``  -> exactly ``N`` groups over the phoneme base
+        (``reconstruct_separated_anchored``), so
+        ``len(separated_phonemes) == len(separated_graphmes)`` always holds.
+      * ``aligned_phonemes``    -> the unambiguous vowel-led grouping
+        (``reconstruct_aligned_vowel_led``), whose length is ``N+1`` -- deliberately
+        *not* equal to ``separated_phonemes``.
+
+    For other languages the count head is trusted via ``reconstruct_groups`` (or
+    ``resegment_by_vowels`` when a vowel set is supplied).
     """
     sep, unit = SEP_UNIT[task]
+    if syllable_is_char and vowel_set is not None:
+        if task == "separated_graphmes":
+            # one grapheme per group, deterministically from the source text
+            return sep.join(src_units)
+        if task == "separated_phonemes":
+            n = n_chars if n_chars is not None else len(src_units)
+            return reconstruct_separated_anchored(
+                phoneme_tokens, counts, n, sep, unit)
+        if task == "aligned_phonemes":
+            n = n_chars if n_chars is not None else len(src_units)
+            return reconstruct_aligned_vowel_led(
+                phoneme_tokens, vowel_set, sep, unit, expected_n=n)
     if task == "separated_graphmes":
         base = src_units
     else:
@@ -282,8 +307,9 @@ def main():
                     units = tokenizer.tokenize(m["text"])
                     inp.append((units, src_vocab.encode(units)))
                 maxlen = max(len(u) for u, _ in inp)
+                # batch-first [B, S]; model.generate() transposes to [S, B] internally
                 src_t = torch.tensor([e + [0] * (maxlen - len(e)) for _, e in inp],
-                                     dtype=torch.long, device=device).transpose(0, 1)
+                                     dtype=torch.long, device=device)
                 src_len_t = torch.tensor([len(e) for _, e in inp], dtype=torch.long,
                                          device=device)
                 lang_t = torch.tensor([meta["lang2id"][m["lang"]] for m in sample],
@@ -298,13 +324,16 @@ def main():
                     for task in ("separated_graphmes", "separated_phonemes", "aligned_phonemes"):
                         counts = counts_from_ids(out[task][i].tolist(), count_codec)
                         vset = None
+                        mchars = tokenizer.tokenize(m["text"])
+                        misc = syllable_is_char.get(m["lang"], False)
                         if task in ("separated_phonemes", "aligned_phonemes"):
                             mlang = m["lang"]
-                            if syllable_is_char.get(mlang) and mlang in vowel_symbols:
+                            if misc and mlang in vowel_symbols:
                                 vset = set(vowel_symbols[mlang])
                         recon = reconstruct_prediction(
-                            tokenizer.tokenize(m["text"]), ph_tokens, counts, task,
-                            vowel_set=vset)
+                            mchars, ph_tokens, counts, task,
+                            vowel_set=vset, n_chars=len(mchars),
+                            syllable_is_char=misc)
                         line += f" | {task}: {recon}"
                     print(line)
 

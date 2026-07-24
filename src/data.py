@@ -420,20 +420,33 @@ class LengthSortedBatchSampler(Sampler):
 
     def __iter__(self):
         rng = random.Random()
-        indices = []
-        for b in self.buckets:
-            b = list(b)
-            if self.shuffle:
-                rng.shuffle(b)  # randomise sample identity within a length range
-            indices.extend(b)
-        for s in range(0, len(indices), self.batch_size):
-            batch = indices[s:s + self.batch_size]
-            if len(batch) == self.batch_size or not self.drop_last:
-                yield batch
+        buckets = [list(b) for b in self.buckets]
+        if self.shuffle:
+            # Randomise sample identity *within* each length-homogeneous bucket
+            # (keeps padding minimal) AND randomise the *order* of the buckets
+            # each epoch (fresh RNG, no fixed seed) so a new epoch does not
+            # always restart with the longest / hardest sequences.  That
+            # curriculum reboot is exactly what produced the periodic loss
+            # spikes seen on TensorBoard right after every epoch boundary.
+            for b in buckets:
+                rng.shuffle(b)
+            order = list(range(len(buckets)))
+            rng.shuffle(order)
+        else:
+            order = range(len(buckets))
+        for bi in order:
+            b = buckets[bi]
+            for s in range(0, len(b), self.batch_size):
+                batch = b[s:s + self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    yield batch
 
     def __len__(self) -> int:
-        n = len(self._sorted)
-        return n // self.batch_size if self.drop_last else (n + self.batch_size - 1) // self.batch_size
+        n = 0
+        for b in self.buckets:
+            n += len(b) // self.batch_size if self.drop_last else \
+                (len(b) + self.batch_size - 1) // self.batch_size
+        return n
 
 
 def make_loader(dataset, batch_size, pad_idx_dict, num_workers, shuffle, pin_memory=True,
